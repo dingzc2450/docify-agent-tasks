@@ -1,0 +1,67 @@
+@@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docify——会干活的AI办公伙伴</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #f8fafc;
+            background-image: 
+                linear-gradient(rgba(59, 130, 246, 0.08) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(59, 130, 246, 0.08) 1px, transparent 1px);
+            background-size: 24px 24px;
+        }
+        .feature-card {
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .feature-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center px-4 py-16">
+
+    <!-- 总标题 -->
+    <h2 class="text-4xl md:text-5xl font-bold text-gray-900 text-center mb-12">
+        能力无界，无限探索
+    </h2>
+
+    <!-- 功能亮点区域 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-8 max-w-6xl w-full">
+        <!-- 功能1：标准化内容生成 -->
+        <div class="feature-card bg-white/90 backdrop-blur-sm p-8 rounded-xl shadow-sm border border-gray-100">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">标准化内容一键生成</h3>
+            <p class="text-gray-600 leading-relaxed">
+                无需从零撰写文档，内置多场景专业写作模板，可自动生成业务宣传文章、客户落地案例、产品需求文档、财务分析报告、知识图谱可视化等多种标准化内容，符合企业内部格式规范，大幅降低撰写成本。
+            </p>
+        </div>
+
+        <!-- 功能2：业务数据分析 -->
+        <div class="feature-card bg-white/90 backdrop-blur-sm p-8 rounded-xl shadow-sm border border-gray-100">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">业务数据自动分析</h3>
+            <p class="text-gray-600 leading-relaxed">
+                上传财务报表、销售明细、零售流水、费用单据等业务数据后，可自动完成数据清洗、多维度统计、异常点识别、趋势预测、可视化图表生成，直接输出可落地的业务建议，无需人工逐行处理。
+            </p>
+        </div>
+
+        <!-- 功能3：重复事务托管 -->
+        <div class="feature-card bg-white/90 backdrop-blur-sm p-8 rounded-xl shadow-sm border border-gray-100">
+            <h3 class="text-2xl font-semibold text-gray-800 mb-4">重复事务托管执行</h3>
+            <ul class="text-gray-600 leading-relaxed text-left space-y-2">
+                <li>✓ 定时任务自动推送：按预设时间和接收对象，自动发送简报、行业动态、业务报表等内容</li>
+                <li>✓ 批量操作自动执行：支持批量账号激活、批量文档格式转换、批量数据处理等重复操作</li>
+                <li>✓ 文档审阅自动处理：可自动完成文档批注添加、修订意见汇总、格式合规检查等审阅工作</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- 页脚 -->
+    <div class="mt-16 text-gray-500 text-sm">
+        © 2026 Docify 智能办公
+    </div>
+</body>
+</html>
