@@ -108,6 +108,20 @@ AGENT_FULLSTACK = "a04834ef-c21a-4559-95e1-46e7a859e04c"  # 全栈开发者
 # 建单描述统一提示（99% 基于 develop 起支线）
 BRANCH_HINT = "> 约定：99% 情况基于 `develop` 起支线开发（除非任务另有说明）。"
 
+# 前端本地联调 & 提交纪律（陆叙 2026-08-13 明确），按目标仓库条件化写进派单描述：
+DEV_ENV_HINT_COMMON = (
+    "> 🔧 本地联调环境变量：私库 `docify-agent-tasks/env-examples/` 有 docify-web 与 "
+    "docify-agent 的前端自动化登录配置（含测试账号/代理），直接复制到对应项目 `.env.local` 用即可，"
+    "别自己造账号。"
+)
+DEV_ENV_HINT_WEB = (
+    "> ⚠️ docify-web 的 `vendor` 是由根目录脚本 `agent-pages:vendor-sync` 同步得到的，"
+    "**不要直接改 vendor 目录并提交**——改动源头、跑同步脚本重新生成。"
+)
+DEV_ENV_HINT_AGENT = (
+    "> ⚠️ agent 相关内容一律在 **docify-agent** 项目里改和测（不要在 docify-web 侧改 agent 逻辑）。"
+)
+
 
 # ── 分类关键词（初判，最终结合截图综合）─────────────────────────────────────
 FE_CATS = {"UI"}                                     # 问题分类里明确前端的
@@ -580,6 +594,13 @@ def build_description(x: dict, kind: str) -> str:
         BRANCH_HINT,
         f"> 目标仓库：**{repos}**（99% 情况基于 `develop` 起支线）。",
     ]
+    # 前端联调 & 提交纪律：前端件必带登录配置提示，按命中的仓库追加对应警告。
+    if x["cls"] == "frontend":
+        lines += ["", "## 开发提示", DEV_ENV_HINT_COMMON]
+        if "docify-web" in x["repos"]:
+            lines.append(DEV_ENV_HINT_WEB)
+        if "docify-agent" in x["repos"]:
+            lines.append(DEV_ENV_HINT_AGENT)
     if x["n_shots"] or x["n_env"]:
         lines += ["", f"## 附件", f"- 问题截图 {x['n_shots']} 张、环境 {x['n_env']} 张（见附件区）"]
     if kind == "analysis":
