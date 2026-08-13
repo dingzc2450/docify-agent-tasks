@@ -317,8 +317,11 @@ def derive_title(desc: str, category: str, menu: str) -> str:
 
 
 # ── 主流程 ─────────────────────────────────────────────────────────────────
-def collect(tokens: TokenManager, download: bool):
-    """拉表 → 筛选 → 综合判定，返回 (items, stats)。items 每条含判定结果与本地截图。"""
+def collect(tokens: TokenManager, download: bool, progress_set: set | None = None):
+    """拉表 → 筛选 → 综合判定，返回 (items, stats)。items 每条含判定结果与本地截图。
+    progress_set：纳入的【解决进展】值集合，默认只 {未解决}（派单口径）；
+    后端检查单口径传 {未解决, 处理中}。"""
+    progress_set = progress_set or {UNRESOLVED}
     rows = fetch_grid(tokens)
     hdr = rows[0] if rows else []
     stats = {"total_rows": len(rows) - 1, "with_desc": 0, "sys_off": 0,
@@ -338,7 +341,7 @@ def collect(tokens: TokenManager, download: bool):
             stats["sys_off"] += 1
             stats["other_systems"][system or "空"] = stats["other_systems"].get(system or "空", 0) + 1
             continue
-        if progress != UNRESOLVED:
+        if progress not in progress_set:
             stats["not_unresolved"] += 1
             continue
 
@@ -365,6 +368,7 @@ def collect(tokens: TokenManager, download: bool):
         items.append({
             "row": ri, "system": system, "menu": menu, "category": category,
             "title": title, "desc": desc, "priority": priority, "dev": dev,
+            "progress": progress,
             "cls": cls, "difficulty": difficulty, "reason": reason,
             "n_shots": n_shots, "n_env": len(env_tokens),
             "shots_local": shots_local, "fingerprint": fp,
@@ -462,6 +466,100 @@ def map_priority(feishu_pri: str) -> str:
         (feishu_pri or "").strip(), "none")
 
 
+# ── 后端检查单（不逐条建单，每天汇总一张）──────────────────────────────────────
+# 陆叙口径：后端每天出一张检查单（或发消息），含当下「未解决 + 处理中」的后端问题，
+# 每条简单分析好不好改，不给每个后端问题单独建 issue。
+LUXU_MEMBER_ID = "5f4f6c9b-7675-44c9-9394-82fee107a79a"   # 陆叙，检查单里 @他 = 给他发消息
+
+
+def assess_fixability(x: dict) -> tuple[str, str]:
+    """粗评后端问题好不好改，返回 (等级, 一句话依据)。纯启发式，供人工参考。"""
+    t = f"{x['desc']}".lower()
+    if any(w in t for w in ["无法复现", "偶现", "重现不了", "有时候", "偶尔"]):
+        return "难", "无法稳定复现，先要定位触发条件"
+    if any(w in t for w in ["新增", "增加功能", "希望支持", "建议", "期望可以"]):
+        return "难", "偏新增功能/需求，非单纯修 bug"
+    if any(w in t for w in ["性能", "慢", "超时", "卡死", "卡了", "繁忙"]):
+        return "中", "性能/超时类，需 profiling 定位瓶颈"
+    if any(w in t for w in ["越权", "权限", "鉴权"]):
+        return "中", "涉及鉴权/权限逻辑，改动需谨慎回归"
+    if any(w in t for w in ["多语言", "i18n", "英文", "语种", "模板"]):
+        return "较好", "多为文案/模板 i18n，定位快"
+    if any(w in t for w in ["报错", "报了", "error", "500", "502", "validation", "禁止访问", "失败"]):
+        return "较好", "有明确报错，可循栈定位"
+    if any(w in t for w in ["定时", "cron", "周期"]):
+        return "中", "定时/调度逻辑，需覆盖时区/边界"
+    return "中", "需看接口日志进一步判断"
+
+
+def build_backend_digest(items: list, date_str: str) -> str:
+    """把后端问题汇总成一张检查单正文（markdown）。含未解决 + 处理中，分组 + 好不好改。"""
+    be = [x for x in items if x["cls"] == "backend"]
+    unresolved = [x for x in be if x["progress"] == UNRESOLVED]
+    inprog = [x for x in be if x["progress"] == IN_PROGRESS]
+    lvl_order = {"较好": 0, "中": 1, "难": 2}
+
+    def tbl(arr):
+        arr = sorted(arr, key=lambda x: lvl_order.get(assess_fixability(x)[0], 1))
+        out = ["| 行 | 系统 | 标题 | 好不好改 | 依据 |", "|---|---|---|---|---|"]
+        for x in arr:
+            lvl, why = assess_fixability(x)
+            t = x["title"].replace("|", "丨")
+            out.append(f"| {x['row']} | {x['system']} | {t} | **{lvl}** | {why} |")
+        return "\n".join(out)
+
+    from collections import Counter
+    lvlc = Counter(assess_fixability(x)[0] for x in be)
+    lines = [
+        f"> 飞书「问题记录」表后端问题自动巡检 · {date_str} · [打开原表]({SHEET_URL})",
+        "",
+        f"后端问题共 **{len(be)}** 条（未解决 {len(unresolved)} · 处理中 {len(inprog)}）；"
+        f"好不好改：较好 {lvlc['较好']} / 中 {lvlc['中']} / 难 {lvlc['难']}。",
+        "",
+        "> 说明：本单只做汇总 + 粗评，**不逐条建单、不派人**。「好不好改」为启发式估计，"
+        "供排期参考，具体以开发看代码为准。",
+        "",
+        f"## 未解决（{len(unresolved)}）",
+        tbl(unresolved) if unresolved else "（无）",
+        "",
+        f"## 处理中（{len(inprog)}）",
+        tbl(inprog) if inprog else "（无）",
+    ]
+    return "\n".join(lines)
+
+
+def create_backend_digest_issue(items: list, date_str: str, dry: bool) -> str | None:
+    """建一张「后端问题检查单」，@陆叙通知；不派人。已有当天单则复用（幂等）。"""
+    title = f"后端问题检查单 {date_str}"
+    body = build_backend_digest(items, date_str)
+    # 正文尾部 @陆叙 = 给他发消息（他要「单独给我发信息即可」）。
+    body += f"\n\n---\n[@陆叙](mention://member/{LUXU_MEMBER_ID}) 今日后端巡检如上，请点单看好不好改的粗评。"
+    if dry:
+        be = [x for x in items if x["cls"] == "backend"]
+        log(f"[dry] 建后端检查单《{title}》 后端 {len(be)} 条（不派人，@陆叙）")
+        return "dry-run-id"
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8",
+                                     dir=os.getcwd()) as tf:
+        tf.write(body)
+        p = tf.name
+    cmd = ["multica", "issue", "create", "--title", title, "--description-file", p,
+           "--project", PROJECT_ID, "--status", "todo", "--priority", "medium",
+           "--allow-duplicate", "--output", "json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            log(f"后端检查单建单失败: {r.stderr.strip()[:300]}")
+            return None
+        out = r.stdout.strip()
+        s = out.find("{")
+        return (json.loads(out[s:]) if s >= 0 else {}).get("id")
+    finally:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
 def build_description(x: dict, kind: str) -> str:
     """kind: 'formal'(正式处理单) / 'analysis'(分析问题单)。"""
     repos = "、".join(x["repos"])
@@ -539,6 +637,10 @@ def main() -> int:
                     help="真实建单 + 回写（需 L「丁」选项就绪；否则阻塞报错）。慎用。")
     ap.add_argument("--limit", type=int, default=0,
                     help="配合 --execute：只处理前 N 条做小样验证（0=全量）")
+    ap.add_argument("--backend-digest", action="store_true",
+                    help="建一张后端问题检查单（未解决+处理中，含好不好改粗评，@陆叙），不逐条建单。"
+                         "配合 --execute 才真实建单，否则 dry 预览。")
+    ap.add_argument("--date", default="", help="检查单日期(YYYY-MM-DD)，默认取本机当天")
     args = ap.parse_args()
 
     app_id, app_secret = os.environ.get("FEISHU_APP_ID"), os.environ.get("FEISHU_APP_SECRET")
@@ -554,6 +656,20 @@ def main() -> int:
     log(f"L(开发) 下拉选项={l_options}")
     log(f"M(解决进展) 下拉选项={m_options}")
     ding_ready = any(v in l_options for v in DING_WRITE_PREFERENCE)
+
+    # ── 后端检查单模式（不逐条建单，汇总一张）──
+    if args.backend_digest:
+        date_str = args.date or time.strftime("%Y-%m-%d")
+        # 后端口径更宽：未解决 + 处理中。截图对汇总表无用，不下载。
+        items, stats = collect(tokens, download=False,
+                               progress_set={UNRESOLVED, IN_PROGRESS})
+        be = [x for x in items if x["cls"] == "backend"]
+        log(f"后端检查单 {date_str}：后端问题 {len(be)} 条"
+            f"（未解决 {sum(1 for x in be if x['progress']==UNRESOLVED)} / "
+            f"处理中 {sum(1 for x in be if x['progress']==IN_PROGRESS)}）")
+        iid = create_backend_digest_issue(items, date_str, dry=not args.execute)
+        log(f"{'完成' if args.execute else 'DRY'}：后端检查单 issue={iid}")
+        return 0
 
     read_only = args.report or args.dry_run or not args.execute
     if not args.execute:
