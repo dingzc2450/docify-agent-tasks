@@ -64,7 +64,12 @@ COL_TESTS, COL_ENV, COL_ACCT, COL_PRI = 5, 6, 7, 9
 COL_DATE, COL_DEV, COL_PROGRESS, COL_REMARK = 10, 11, 12, 13
 
 # ── 锁定的筛选口径 ─────────────────────────────────────────────────────────
-TARGET_SYSTEMS = {"Docify-用户端", "Docify官网"}   # 精确文本；管理端/.jp 变体默认不处理
+# 陆叙 2026-08-13 澄清 .jp/管理端 都是不同域名/环境的测试，一并纳入：
+#   Docify官网 / Docify.jp官网      → jp/主域名官网，前端为主 → docify-main
+#   Docify-用户端 / Docify.jp-用户端 → docify-agent(+web) 前后端
+#   Docify-管理端                    → docify-admin 前后端
+TARGET_SYSTEMS = {"Docify-用户端", "Docify官网",
+                  "Docify.jp官网", "Docify.jp-用户端", "Docify-管理端"}
 UNRESOLVED = "未解决"
 IN_PROGRESS = "处理中"   # M 回写值（M 现为下拉，「处理中」是合法选项，实测确认）
 # 【开发】列已标不豁免——仍纳入筛选，靠去重指纹 + 已存在 issue 判定收敛。
@@ -83,9 +88,11 @@ class BlockedError(RuntimeError):
 # ── 系统 → 仓库 ────────────────────────────────────────────────────────────
 def repos_for(system: str, category: str) -> list[str]:
     """系统 + 前后端归属 → 目标仓库。"""
-    if system == "Docify官网":
-        return ["docify-main"]
-    # Docify-用户端
+    if system in ("Docify官网", "Docify.jp官网"):
+        return ["docify-main"]                   # 官网(含 jp)，前端为主
+    if system == "Docify-管理端":
+        return ["docify-admin"]                  # 管理端前后端
+    # Docify-用户端 / Docify.jp-用户端（jp 只是域名/环境差异，仓库同用户端）
     if category == "frontend":
         return ["docify-agent", "docify-web"]   # 过渡期前端双写
     return ["docify-agent"]                      # 后端 / 不确定默认落 agent
