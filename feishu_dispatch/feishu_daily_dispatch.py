@@ -469,7 +469,10 @@ def map_priority(feishu_pri: str) -> str:
 # ── 后端检查单（不逐条建单，每天汇总一张）──────────────────────────────────────
 # 陆叙口径：后端每天出一张检查单（或发消息），含当下「未解决 + 处理中」的后端问题，
 # 每条简单分析好不好改，不给每个后端问题单独建 issue。
-LUXU_MEMBER_ID = "5f4f6c9b-7675-44c9-9394-82fee107a79a"   # 陆叙，检查单里 @他 = 给他发消息
+LUXU_MEMBER_ID = "5f4f6c9b-7675-44c9-9394-82fee107a79a"   # 陆叙
+# 陆叙口径：要「私信/消息、进收件箱、不建单」。Multica 里进人收件箱=@mention 通知，
+# 所以后端巡检改为**在本任务下发一条 @陆叙 的评论**（消息，不新建 issue）。
+DIGEST_ISSUE_ID = "4ac5bbff-2044-4fae-bb66-d155016b5059"   # MYD-175 本任务
 
 
 def assess_fixability(x: dict) -> tuple[str, str]:
@@ -528,27 +531,26 @@ def build_backend_digest(items: list, date_str: str) -> str:
     return "\n".join(lines)
 
 
-def create_backend_digest_issue(items: list, date_str: str, dry: bool) -> str | None:
-    """建一张「后端问题检查单」，@陆叙通知；不派人。已有当天单则复用（幂等）。"""
-    title = f"后端问题检查单 {date_str}"
-    body = build_backend_digest(items, date_str)
-    # 正文尾部 @陆叙 = 给他发消息（他要「单独给我发信息即可」）。
-    body += f"\n\n---\n[@陆叙](mention://member/{LUXU_MEMBER_ID}) 今日后端巡检如上，请点单看好不好改的粗评。"
+def send_backend_digest_message(items: list, date_str: str, dry: bool) -> str | None:
+    """把后端巡检作为**消息**发进陆叙收件箱：在本任务下发一条 @陆叙 的评论，
+    不新建 issue（陆叙口径：要私信/消息、进收件箱、不建单）。返回评论 id。"""
+    be = [x for x in items if x["cls"] == "backend"]
+    body = (f"[@陆叙](mention://member/{LUXU_MEMBER_ID}) 后端问题每日巡检 · {date_str}\n\n"
+            + build_backend_digest(items, date_str))
     if dry:
-        be = [x for x in items if x["cls"] == "backend"]
-        log(f"[dry] 建后端检查单《{title}》 后端 {len(be)} 条（不派人，@陆叙）")
+        log(f"[dry] 发消息给陆叙（评论·不建单）：后端 {len(be)} 条")
         return "dry-run-id"
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8",
                                      dir=os.getcwd()) as tf:
         tf.write(body)
         p = tf.name
-    cmd = ["multica", "issue", "create", "--title", title, "--description-file", p,
-           "--project", PROJECT_ID, "--status", "todo", "--priority", "medium",
-           "--allow-duplicate", "--output", "json"]
+    # 根评论（不带 --parent）→ 作为新消息进陆叙收件箱。
+    cmd = ["multica", "issue", "comment", "add", DIGEST_ISSUE_ID,
+           "--content-file", p, "--output", "json"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
-            log(f"后端检查单建单失败: {r.stderr.strip()[:300]}")
+            log(f"后端巡检消息发送失败: {r.stderr.strip()[:300]}")
             return None
         out = r.stdout.strip()
         s = out.find("{")
@@ -667,8 +669,8 @@ def main() -> int:
         log(f"后端检查单 {date_str}：后端问题 {len(be)} 条"
             f"（未解决 {sum(1 for x in be if x['progress']==UNRESOLVED)} / "
             f"处理中 {sum(1 for x in be if x['progress']==IN_PROGRESS)}）")
-        iid = create_backend_digest_issue(items, date_str, dry=not args.execute)
-        log(f"{'完成' if args.execute else 'DRY'}：后端检查单 issue={iid}")
+        mid = send_backend_digest_message(items, date_str, dry=not args.execute)
+        log(f"{'完成' if args.execute else 'DRY'}：后端巡检消息(评论·不建单) id={mid}")
         return 0
 
     read_only = args.report or args.dry_run or not args.execute
