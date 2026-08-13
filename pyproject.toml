@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docify-scripts"
+version = "0.1.0"
+description = "Python scripts for managing markdown tasks, issues, and highlights in Docify workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "docify-agent" }]
+dependencies = []
+
+[project.scripts]
+docify-md = "docify_scripts.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
