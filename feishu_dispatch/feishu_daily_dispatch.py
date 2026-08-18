@@ -722,14 +722,26 @@ def main() -> int:
         return 3
     log(f"真实模式：L 将写选项「{ding_val}」" + (f"（仅前 {args.limit} 条小样）" if args.limit else "（全量）"))
     items, stats = collect(tokens, download=not args.no_download)
-    # 只有「简单件」才走正式处理单（派人 + 回写 L/M）；难/不确定不动，等授权。
+    # (1) 简单前端件：走正式处理单（原口径）。
     easy = [x for x in items if x["cls"] != "uncertain" and x["difficulty"] == "easy"]
+    # (2) 测试人员已在表里直接指派给【丁】、且未解决、尚未建单的问题：无论前后端难易，
+    #     都建正式处理单跟踪调研+修复（陆叙 2026-08-13）。L 已是丁，仍回写 M=处理中 保证跨天幂等。
+    ding_assigned = [x for x in items if x["dev"].strip() in DING_VALUES]
+    # 合并去重（按指纹），保持 easy 在前的顺序。
+    seen_fp, todo = set(), []
+    for x in easy + ding_assigned:
+        if x["fingerprint"] in seen_fp:
+            continue
+        seen_fp.add(x["fingerprint"])
+        todo.append(x)
     if args.limit:
-        easy = easy[:args.limit]
-    log(f"本次真实处理 {len(easy)} 条简单件（正式处理单）；其余进分析单/不确定，不派人不回写。")
+        todo = todo[:args.limit]
+    log(f"本次真实处理 {len(todo)} 条正式处理单"
+        f"（简单前端 {len(easy)} + 指派给丁 {len(ding_assigned)}，去重后 {len(todo)}）；"
+        f"其余不派人不回写。")
     state = load_state()
     done = 0
-    for x in easy:
+    for x in todo:
         fp = x["fingerprint"]
         if fp in state:
             # 已存在 issue → 重置为 todo 交陆叙人工，不重复建单（幂等）。
@@ -749,7 +761,7 @@ def main() -> int:
         done += 1
         log(f"  ✓ 行{x['row']} issue={issue_id} 已派项目主管，L={ding_val}/M={IN_PROGRESS}")
         time.sleep(0.3)
-    log(f"完成（真实）：处理 {done}/{len(easy)} 条简单件（正式处理单）。")
+    log(f"完成（真实）：处理 {done}/{len(todo)} 条正式处理单。")
     return 0
 
 
