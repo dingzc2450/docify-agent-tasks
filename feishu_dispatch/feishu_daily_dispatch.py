@@ -27,6 +27,24 @@
   3. 先出报告：--report/--dry-run 只读，产出前端/后端/不确定三张清单交陆叙复核；
      复核后再放开真实建单/回写，最后才建每日 autopilot。
 
+MYD-272 定稿的建单规则（2026-09-07 并入本脚本，替换旧的本地 state 去重）：
+  1. **查重是双键、且查平台不查本地**。行号做主键已被证伪（行 158 五天内指向两条
+     不同记录，原表上方插行导致漂移），本地 state 又会被 autopilot 每次 checkout 抹掉。
+     改为把键写进 issue metadata，用 `multica issue list --metadata k=v` 精确查：
+       · feishu_fingerprint_v2 = sha1(系统|菜单|问题分类|问题描述|更新日期|截图fileToken) —— 主键
+       · feishu_fingerprint    = sha1(系统|菜单|问题分类|问题描述|更新日期)             —— 次级键/兜底
+       · feishu_row            = <表token>!<sheetId>#<行号> —— 仅提示，会漂移
+       · feishu_row_verified   = bool，表示行号在建单当刻核对过
+     v2 优先，未命中再查 v1（截图被重传会换 token，v2 会假阴性，故 v1 必须保留）。
+     无截图的行 v2 不可算（原表约 19 行），**自动降级为只用 v1**。
+  2. **v1 相撞的行禁用 v1 兜底**。全表跑一遍 v1，凡指纹重复的行（实测「会话区」5 行
+     同系统同菜单同分类且描述全空）只认 v2；这些行若又没截图 → 不建单，进人工清单。
+  3. **跳过必须留痕**。每轮扫描都要打印跳过了哪些行、命中的是哪个键、撞上的是哪张单，
+     不允许静默跳过——否则漏建和重复建都查不出来。
+  4. **优先级按口径机械判定**：功能问题=medium、纯 UI/文案=low；整页不可用或数据取不到
+     上调一档；dev/测试环境的行封顶 medium（不出 high），生产域名的行才可能到 high。
+  5. 截图落地按 magic number 定扩展名（原表 PNG/JPEG 混用，文件名不可信）。
+
 环境变量：FEISHU_APP_ID / FEISHU_APP_SECRET
 
 用法：
@@ -37,6 +55,8 @@
 """
 
 import argparse
+import collections
+import datetime
 import hashlib
 import json
 import os
@@ -54,7 +74,10 @@ BASE = "https://open.feishu.cn/open-apis"
 SHEET_TOKEN = "Kq1nsadnQh8IzBt3MDWc1bCnnkc"   # 电子表格 token（直接可用，非 wiki）
 SHEET_ID = "16e99d"                            # 子表「问题记录」
 SHEET_URL = f"https://blxv28dmue.feishu.cn/sheets/{SHEET_TOKEN}"
-MAX_ROW = 231                                  # grid row_count（探查所得，留足冗余）
+# 行数每周都在涨（2026-08 是 231，2026-09-07 已 330），写死会漏读尾部新行 →
+# 运行时查 grid row_count，查不到才退回这个下限。
+MAX_ROW_FALLBACK = 600
+MAX_ROW = MAX_ROW_FALLBACK
 
 # ── 列索引（0 基，实测表头对齐）────────────────────────────────────────────
 # A系统 B菜单 C问题分类 D问题描述 E问题截图 F测试内容/指令 G环境 H账号 I(空) J优先级
@@ -69,7 +92,8 @@ COL_DATE, COL_DEV, COL_PROGRESS, COL_REMARK = 10, 11, 12, 13
 #   Docify-用户端 / Docify.jp-用户端 → docify-agent(+web) 前后端
 #   Docify-管理端                    → docify-admin 前后端
 TARGET_SYSTEMS = {"Docify-用户端", "Docify官网",
-                  "Docify.jp官网", "Docify.jp-用户端", "Docify-管理端"}
+                  "Docify.jp官网", "Docify.jp-用户端", "Docify-管理端",
+                  "cn官网"}          # MYD-272 新发现的变体：中国站官网，等同 Docify官网
 UNRESOLVED = "未解决"
 IN_PROGRESS = "处理中"   # M 回写值（M 现为下拉，「处理中」是合法选项，实测确认）
 # 【开发】列已标不豁免——仍纳入筛选，靠去重指纹 + 已存在 issue 判定收敛。
@@ -77,6 +101,10 @@ IN_PROGRESS = "处理中"   # M 回写值（M 现为下拉，「处理中」是�
 #   {丁志诚, 者俊, 闫超, 陈浩}——注意没有裸「丁」！旧文本「丁」「丁？」是遗留脏值。
 # 「分配给丁」的判定 = L ∈ 下面这些值（含遗留文本 + 正式选项）。
 DING_VALUES = {"丁", "丁？", "丁志诚"}
+# 已经写了别人名字的行**不抢**（MYD-272 口径：那轮的筛选是 系统∈目标 AND 未解决
+# AND 开发=丁志诚）。实测 L 列里 闫超 107 行、者俊 11、陈浩 3、冯志康 2——如果放任
+# 「简单前端件」那条老规则去建单，会把别人名下的 bug 又派给丁一遍。
+OTHER_OWNERS = {"者俊", "闫超", "陈浩", "冯志康"}
 # 回写 L 时的目标：优先裸「丁」（若被加进选项），否则用已存在的合法选项「丁志诚」。
 # 二者都不在选项里 → 阻塞，不瞎写文本（会破坏下拉校验）。
 DING_WRITE_PREFERENCE = ["丁", "丁志诚"]
@@ -88,8 +116,8 @@ class BlockedError(RuntimeError):
 # ── 系统 → 仓库 ────────────────────────────────────────────────────────────
 def repos_for(system: str, category: str) -> list[str]:
     """系统 + 前后端归属 → 目标仓库。"""
-    if system in ("Docify官网", "Docify.jp官网"):
-        return ["docify-main"]                   # 官网(含 jp)，前端为主
+    if system in ("Docify官网", "Docify.jp官网", "cn官网"):
+        return ["docify-main"]                   # 官网(含 jp / cn 变体)，前端为主
     if system == "Docify-管理端":
         return ["docify-admin"]                  # 管理端前后端
     # Docify-用户端 / Docify.jp-用户端（jp 只是域名/环境差异，仓库同用户端）
@@ -223,9 +251,30 @@ class TokenManager:
 
 
 # ── sheets 读取 ────────────────────────────────────────────────────────────
+def probe_max_row(tokens: TokenManager) -> int:
+    """查子表真实 grid row_count；失败退回 MAX_ROW_FALLBACK。
+    写死行数会漏读尾部新增行（这张表每周都在长），所以每次运行都探一次。"""
+    global MAX_ROW
+    try:
+        p = _request("GET", f"/sheets/v3/spreadsheets/{SHEET_TOKEN}/sheets/query",
+                     token=tokens.get())
+        for s in p["data"].get("sheets") or []:
+            if s.get("sheet_id") == SHEET_ID:
+                n = int((s.get("grid_properties") or {}).get("row_count") or 0)
+                if n > 0:
+                    MAX_ROW = n
+                    log(f"子表 {SHEET_ID} 实际行数={n}")
+                    return n
+    except Exception as e:  # noqa: BLE001
+        log(f"行数探查失败，退回 {MAX_ROW_FALLBACK}: {e}")
+    MAX_ROW = MAX_ROW_FALLBACK
+    return MAX_ROW
+
+
 def fetch_grid(tokens: TokenManager) -> list[list]:
     """拉整块 A1:N{MAX_ROW}，UnformattedValue 渲染——文本正常返回，
-    内嵌图片(embed-image)单元格会带 fileToken，可下载。"""
+    内嵌图片(embed-image)单元格会带 fileToken，可下载。
+    ⚠️ 不能换成 ToString/FormattedValue：那两种渲染会把 fileToken 抹掉，v2 指纹就算不出来。"""
     rng = f"{SHEET_ID}!A1:N{MAX_ROW}"
     p = _request("GET",
                  f"/sheets/v2/spreadsheets/{SHEET_TOKEN}/values_batch_get"
@@ -273,9 +322,51 @@ def get(row: list, idx: int):
     return row[idx] if idx < len(row) else None
 
 
+# ── 指纹专用取值（MYD-272）─────────────────────────────────────────────────
+# 与 cell_text 刻意分开：cell_text 有 link/name 兜底、会随渲染改动，
+# 而指纹一旦变了就等于全表重建单。这两个函数是**哈希输入的一部分，不要改**。
+def fp_text(v) -> str:
+    """指纹口径的单元格文本：只取 text 段，图片段计空串。"""
+    if v is None:
+        return ""
+    if isinstance(v, list):
+        return "".join((s.get("text") or "") if isinstance(s, dict) else str(s)
+                       for s in v).strip()
+    if isinstance(v, dict):
+        return (v.get("text") or "").strip()
+    return str(v).strip()
+
+
+def fp_date(v) -> str:
+    """K【更新日期】在 UnformattedValue 下是 Excel 序列号 → 归一成 YYYY/MM/DD。"""
+    raw = fp_text(v)
+    try:
+        n = int(float(raw))
+    except (TypeError, ValueError):
+        return raw
+    return (datetime.date(1899, 12, 30) + datetime.timedelta(days=n)).strftime("%Y/%m/%d")
+
+
+IMAGE_MAGIC = [(b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+               (b"GIF8", ".gif"), (b"RIFF", ".webp"), (b"BM", ".bmp")]
+
+
+def image_ext(head: bytes) -> str | None:
+    """按 magic number 定扩展名。原表内嵌图 PNG/JPEG 混用且文件名不可信，
+    扩展名写错 Multica 侧就渲染不出缩略图。识别不出 → None（不是图片，多半是错误 JSON）。"""
+    for sig, ext in IMAGE_MAGIC:
+        if head.startswith(sig):
+            return ext
+    return None
+
+
 def download_media(tokens: TokenManager, file_tokens: list[str], dest: str,
                    prefix: str) -> list[str]:
-    """下载 sheets 内嵌图片到 dest，返回本地路径。"""
+    """下载 sheets 内嵌图片到 dest，返回本地路径。
+    两条注意（MYD-272 踩过）：
+      · Authorization 头必须真的带上 token，否则接口返 400 并把 JSON 错误写进目标文件，
+        得到一个「看起来下载成功」的坏图 → 这里按 magic number 校验，非图片直接丢弃。
+      · 扩展名按内容判定，不信文件名（同一列里 PNG/JPEG 混用）。"""
     paths = []
     for i, ftok in enumerate(file_tokens):
         try:
@@ -284,27 +375,54 @@ def download_media(tokens: TokenManager, file_tokens: list[str], dest: str,
             p = _request("GET", u, token=tokens.get())
             urls = p["data"].get("tmp_download_urls") or []
             if not urls:
+                log(f"截图无下载地址 {ftok[:12]}")
                 continue
             dl = urls[0]["tmp_download_url"]
-            local = os.path.join(dest, f"{prefix}_{i+1}.jpg")
             req = urllib.request.Request(dl, headers={"Authorization": f"Bearer {tokens.get()}"})
-            with urllib.request.urlopen(req, timeout=60) as resp, open(local, "wb") as fh:
-                fh.write(resp.read())
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                blob = resp.read()
+            ext = image_ext(blob[:16])
+            if not ext:
+                log(f"截图内容不是图片(可能是鉴权失败的 JSON)，丢弃 {ftok[:12]}: {blob[:80]!r}")
+                continue
+            local = os.path.join(dest, f"{prefix}_{i+1}{ext}")
+            with open(local, "wb") as fh:
+                fh.write(blob)
             paths.append(local)
         except Exception as e:  # noqa: BLE001
             log(f"截图下载失败 {ftok[:12]}: {e}")
     return paths
 
 
-# ── 去重指纹 & state ──────────────────────────────────────────────────────
+# ── 去重指纹（MYD-272 定稿：v2 主键 + v1 兜底，写进 issue metadata）──────────
+# 三个 metadata 键名是**跨轮次契约**，改名等于全表重建单，不要动。
+MK_FP1 = "feishu_fingerprint"        # sha1(系统|菜单|问题分类|问题描述|更新日期)
+MK_FP2 = "feishu_fingerprint_v2"     # 上式再拼 |截图fileToken 列表 —— 主键
+MK_ROW = "feishu_row"                # <表token>!<sheetId>#<行号>，仅提示，会漂移
+MK_ROW_OK = "feishu_row_verified"    # bool，建单当刻核对过行号
+
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           ".daily_dispatch_state.json")
 
 
-def fingerprint(system: str, title: str, desc: str) -> str:
-    """系统 | 标题 | 描述前80字SHA1，不绑行号。"""
-    h = hashlib.sha1((desc or "")[:80].encode("utf-8")).hexdigest()[:12]
-    return f"{system}|{title[:40]}|{h}"
+def fingerprint_v1(system: str, menu: str, category: str, desc: str, date: str) -> str:
+    """内容指纹，不含行号（行号会因上方插行漂移，行 158 已实证）。"""
+    return hashlib.sha1("|".join([system, menu, category, desc, date]).encode()).hexdigest()
+
+
+def fingerprint_v2(system: str, menu: str, category: str, desc: str, date: str,
+                   shot_tokens: list[str]) -> str | None:
+    """v1 再拼截图 fileToken —— 实测全表唯一，作主键。
+    无截图 → None（约 19 行），这类行自动降级为只用 v1 查重。"""
+    if not shot_tokens:
+        return None
+    return hashlib.sha1(
+        "|".join([system, menu, category, desc, date, ",".join(shot_tokens)]).encode()
+    ).hexdigest()
+
+
+def row_key(row: int) -> str:
+    return f"{SHEET_TOKEN}!{SHEET_ID}#{row}"
 
 
 def load_state() -> dict:
@@ -323,33 +441,183 @@ def save_state(state: dict) -> None:
         log(f"状态文件写入失败: {e}")
 
 
-def derive_title(desc: str, category: str, menu: str) -> str:
-    body = (desc or "").strip()
-    if body:
-        return body.splitlines()[0].strip()[:60]
-    return f"[{menu or '未分类'}] {category or '问题'}"[:60]
+# ── 平台侧查重（本地 state 会被 autopilot 每次 checkout 抹掉，不能当真相）────────
+_dedup_cache: dict[str, list] = {}
+
+
+def query_issues_by_metadata(key: str, value: str) -> list[dict]:
+    """multica issue list --metadata k=v，精确查已建单。查不动 → 抛异常（宁可停也不重复建单）。"""
+    ck = f"{key}={value}"
+    if ck in _dedup_cache:
+        return _dedup_cache[ck]
+    cmd = ["multica", "issue", "list", "--metadata", f"{key}={value}",
+           "--limit", "20", "--output", "json"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"查重失败 {ck}: {r.stderr.strip()[:200]}")
+    out = r.stdout.strip()
+    s = out.find("{")
+    issues = (json.loads(out[s:]) if s >= 0 else {}).get("issues") or []
+    _dedup_cache[ck] = issues
+    return issues
+
+
+def find_existing(x: dict) -> tuple[dict | None, str]:
+    """按 v2 → v1 顺序查已建单。返回 (issue|None, 命中的键名/未命中原因)。
+
+    规则来源 MYD-272：
+      · v2 优先：含截图 fileToken，实测全表唯一。
+      · v1 兜底：截图被重传会换 token → v2 假阴性，必须再查一次 v1。
+      · v1 相撞的行（同系统/菜单/分类且描述为空的那几行）**禁用 v1 兜底**，
+        否则会把邻行的单当成自己的单而漏建。
+    """
+    if x["fp2"]:
+        hit = query_issues_by_metadata(MK_FP2, x["fp2"])
+        if hit:
+            return hit[0], MK_FP2
+    if x["v1_ambiguous"]:
+        return None, "v1兜底已禁用(该行v1指纹与其它行相撞)"
+    hit = query_issues_by_metadata(MK_FP1, x["fp1"])
+    if hit:
+        return hit[0], MK_FP1
+    return None, "未命中"
+
+
+def derive_title(desc: str, category: str, menu: str, system: str = "",
+                 date: str = "") -> str:
+    """标题口径与 MYD-274~289 那 16 张单一致：
+      · 有描述 → 多行合成一行，超 60 字截断加省略号；
+      · 描述为空（会话区那几行）→ 用「系统 菜单 分类问题（MM/DD，见截图）」，
+        因为空描述的行只能靠截图区分，标题里必须带日期否则几张单长得一模一样。"""
+    lines = [ln.strip() for ln in (desc or "").splitlines() if ln.strip()]
+    if lines:
+        t = "，".join(lines)
+        return t if len(t) <= 60 else t[:59] + "…"
+    md = date[5:].replace("/", "/") if len(date) >= 10 else date
+    return f"{system} {menu or '未分类'} {category or ''}问题（{md}，见截图）".strip()[:60]
+
+
+# ── 优先级口径（MYD-272 定稿，机械判定；对 MYD-274~289 那 16 张单 100% 复现）────
+# 原表 J【优先级】填写率低且口径不一（描述全空的行也标「高」），只作参考写进描述，不作准。
+# 判定分三步：① 分类定基准档 ② 影响范围上调 ③ dev/测试环境封顶。
+FUNC_CATS = {"功能问题", "功能", "性能问题", "性能", "越权问题", "PDF 生成异常",
+             "文档生成", "上下文问题", "响应中断", "对话意图理解错误", "对话过程"}
+UI_ONLY_CATS = {"UI", "样式", "文案", "多语言", "交互"}
+# 分类为空时才用关键词兜底猜基准档（分类填了就以分类为准——232/249/283 都是
+# 「功能问题」但描述里带「文案」「翻译」，靠关键词会被误降成 low）。
+UI_ONLY_KW = ["文案", "多语言", "未适配", "翻译", "样式", "对齐", "排版",
+              "颜色", "主题色", "字体", "图标", "间距", "居中"]
+# ① 整页不可用 / 数据取不到 → 任何基准档都上调一档（medium→high）
+SEVERE_KW = ["白屏", "打不开", "无法打开", "无法访问", "无法进入", "进不去",
+             "无法加载", "加载不出", "加载失败", "崩溃", "闪退", "卡死", "无响应",
+             "数据丢失", "数据为空", "查不到数据", "全部消失", "无法登录", "无法保存",
+             "无法提交", "无法生成", "500", "502", "404"]
+# ② 影响范围是全局/整页（不是单个元素）→ 只把 UI 类的 low 抬到 medium，不推到 high。
+#    行 255「导航栏展示错乱」、行 282「工作台UI与设计不符」就是靠这条从 low 变 medium；
+#    行 288「页面会撑开变形」是单个元素撑开，不在此列，保持 low。
+SCOPE_KW = ["导航栏", "全站", "全局", "整页", "全页", "所有页面", "每个页面",
+            "与设计不符", "布局错乱", "展示错乱", "错乱"]
+# dev/测试环境 → 封顶 medium（陆叙口径：dev 阶段不出 high）；生产域名才可能到 high
+DEV_ENV_KW = ["dev", "test", "测试", "预发", "pre", "staging", "uat", "本地", "sit"]
+_TIER = ["low", "medium", "high", "urgent"]
+
+
+def looks_dev_env(env: str, system: str) -> bool:
+    """环境列是否指向 dev/测试。注意：232/233/241 的环境写的是「Docify.jp官网」——
+    那是生产域名不是 dev，不能一刀切封顶（MYD-272 里这条被专门纠过）。"""
+    e = (env or "").strip().lower()
+    if not e:
+        return False
+    if "官网" in env or "docify.jp" in e.replace(" ", ""):
+        return False
+    return any(k in e for k in DEV_ENV_KW)
+
+
+def assess_priority(desc: str, category: str, env: str, system: str) -> tuple[str, str]:
+    """返回 (priority, 一句话依据)。依据要写进 issue 描述，便于复核和事后追溯。"""
+    cat = (category or "").strip()
+    text = f"{cat} {desc}".lower()
+
+    # ── ① 基准档
+    if not (desc or "").strip():
+        # 描述为空的行（会话区那几片）只有截图，rubric 判不了 → 取中档，
+        # 并在依据里写明要人工补复现步骤。
+        return "medium", "描述为空，无法按口径判定 → 取中档，需向测试补复现步骤"
+    if cat in UI_ONLY_CATS:
+        base, why = "low", f"纯 UI/文案（分类={cat}）"
+    elif cat in FUNC_CATS:
+        base, why = "medium", f"功能问题（分类={cat}）"
+    elif any(k.lower() in text for k in UI_ONLY_KW):
+        base, why = "low", "分类为空，描述偏 UI/文案"
+    else:
+        base, why = "medium", f"分类={cat or '空'}，按功能问题取中档"
+
+    # ── ② 上调
+    sev = [k for k in SEVERE_KW if k.lower() in text]
+    if sev:
+        base = _TIER[min(_TIER.index(base) + 1, len(_TIER) - 1)]
+        why += f"；整页不可用/数据取不到上调一档（命中「{sev[0]}」）"
+    elif base == "low":
+        scope = [k for k in SCOPE_KW if k.lower() in text]
+        if scope:
+            base = "medium"
+            why += f"；影响范围为全局/整页上调一档（命中「{scope[0]}」）"
+
+    # ── ③ 封顶
+    if base in ("high", "urgent") and looks_dev_env(env, system):
+        base, why = "medium", why + f"；环境={env} 属 dev/测试，封顶 medium"
+    return base, why
 
 
 # ── 主流程 ─────────────────────────────────────────────────────────────────
+def scan_v1_collisions(rows: list[list]) -> tuple[dict[int, str], set[str]]:
+    """全表跑一遍 v1 指纹，找出相撞的指纹（MYD-272：实测「会话区」5 行相撞）。
+
+    必须在**全表**上算，不能只在命中行上算——邻行可能因为进展/系统不同没进候选，
+    但它已经建过单了，v1 兜底照样会撞上去。返回 (行号→v1, 相撞的 v1 集合)。
+    """
+    per_row: dict[int, str] = {}
+    for ri, row in enumerate(rows[1:], start=2):
+        f = [fp_text(get(row, COL_SYS)), fp_text(get(row, COL_MENU)),
+             fp_text(get(row, COL_CAT)), fp_text(get(row, COL_DESC))]
+        if not any(f):          # 整行空，跳过
+            continue
+        per_row[ri] = fingerprint_v1(*f, fp_date(get(row, COL_DATE)))
+    counts = collections.Counter(per_row.values())
+    return per_row, {fp for fp, n in counts.items() if n > 1}
+
+
 def collect(tokens: TokenManager, download: bool, progress_set: set | None = None):
     """拉表 → 筛选 → 综合判定，返回 (items, stats)。items 每条含判定结果与本地截图。
     progress_set：纳入的【解决进展】值集合，默认只 {未解决}（派单口径）；
     后端检查单口径传 {未解决, 处理中}。"""
     progress_set = progress_set or {UNRESOLVED}
     rows = fetch_grid(tokens)
-    hdr = rows[0] if rows else []
+    v1_by_row, v1_collided = scan_v1_collisions(rows)
+    if v1_collided:
+        bad = sorted(r for r, f in v1_by_row.items() if f in v1_collided)
+        log(f"v1 指纹相撞的行（这些行禁用 v1 兜底，只认 v2）：{bad}")
     stats = {"total_rows": len(rows) - 1, "with_desc": 0, "sys_off": 0,
-             "not_unresolved": 0, "matched": 0, "other_systems": {}}
+             "not_unresolved": 0, "matched": 0, "other_systems": {},
+             "v1_collided_rows": sorted(r for r, f in v1_by_row.items() if f in v1_collided),
+             "no_shot_rows": []}
     items = []
     tmpdir = tempfile.mkdtemp(prefix="daily_shots_", dir=os.getcwd()) if download else None
 
     for ri, row in enumerate(rows[1:], start=2):  # 行号从 2 起（1 是表头）
-        desc = cell_text(get(row, COL_DESC))
-        if not desc:
+        # 指纹口径的取值（fp_*），与展示口径 cell_text 分开，见 fp_text 注释。
+        f_sys, f_menu = fp_text(get(row, COL_SYS)), fp_text(get(row, COL_MENU))
+        f_cat, f_desc = fp_text(get(row, COL_CAT)), fp_text(get(row, COL_DESC))
+        f_date = fp_date(get(row, COL_DATE))
+
+        system = f_sys
+        progress = cell_text(get(row, COL_PROGRESS)).strip()
+        shot_tokens = cell_image_tokens(get(row, COL_SHOT))
+
+        # 描述为空但有截图的行（会话区那几行）不能丢——它们是真问题，只是描述没填。
+        if not f_desc and not shot_tokens:
             continue
         stats["with_desc"] += 1
-        system = cell_text(get(row, COL_SYS)).strip()
-        progress = cell_text(get(row, COL_PROGRESS)).strip()
 
         if system not in TARGET_SYSTEMS:
             stats["sys_off"] += 1
@@ -360,19 +628,23 @@ def collect(tokens: TokenManager, download: bool, progress_set: set | None = Non
             continue
 
         stats["matched"] += 1
-        menu = cell_text(get(row, COL_MENU)).strip()
-        category = cell_text(get(row, COL_CAT)).strip()
+        menu, category, desc = f_menu, f_cat, f_desc
         tests = cell_text(get(row, COL_TESTS))
+        env = cell_text(get(row, COL_ENV)).strip()
         dev = cell_text(get(row, COL_DEV)).strip()
-        priority = cell_text(get(row, COL_PRI)).strip()
+        priority_raw = cell_text(get(row, COL_PRI)).strip()
 
-        shot_tokens = cell_image_tokens(get(row, COL_SHOT))
         env_tokens = cell_image_tokens(get(row, COL_ENV))
         n_shots = len(shot_tokens)
+        if not shot_tokens:
+            stats["no_shot_rows"].append(ri)
 
         cls, difficulty, reason = classify(desc, category, menu, tests, n_shots)
-        title = derive_title(desc, category, menu)
-        fp = fingerprint(system, title, desc)
+        title = derive_title(desc, category, menu, system, f_date)
+        fp1 = v1_by_row.get(ri) or fingerprint_v1(f_sys, f_menu, f_cat, f_desc, f_date)
+        fp2 = fingerprint_v2(f_sys, f_menu, f_cat, f_desc, f_date, shot_tokens)
+        v1_ambiguous = fp1 in v1_collided
+        priority, pri_why = assess_priority(desc, category, env, system)
 
         shots_local = []
         if download and (shot_tokens or env_tokens):
@@ -380,12 +652,17 @@ def collect(tokens: TokenManager, download: bool, progress_set: set | None = Non
             shots_local += download_media(tokens, env_tokens, tmpdir, f"r{ri}_env")
 
         items.append({
-            "row": ri, "system": system, "menu": menu, "category": category,
-            "title": title, "desc": desc, "priority": priority, "dev": dev,
-            "progress": progress,
+            "row": ri, "row_key": row_key(ri),
+            "system": system, "menu": menu, "category": category,
+            "title": title, "desc": desc, "date": f_date, "env": env,
+            "priority_raw": priority_raw, "priority": priority, "pri_why": pri_why,
+            "dev": dev, "progress": progress,
             "cls": cls, "difficulty": difficulty, "reason": reason,
             "n_shots": n_shots, "n_env": len(env_tokens),
-            "shots_local": shots_local, "fingerprint": fp,
+            "shots_local": shots_local,
+            "fp1": fp1, "fp2": fp2, "v1_ambiguous": v1_ambiguous,
+            # 既无截图又 v1 相撞 → 两个键都不能唯一定位，不能自动建单。
+            "undedupable": v1_ambiguous and not fp2,
             "repos": repos_for(system, cls),
         })
     stats["tmpdir"] = tmpdir
@@ -403,16 +680,39 @@ def print_report(items: list, stats: dict) -> None:
             print(f"  行{x['row']:>3} | {x['system']} | {x['category'] or '-'} | 截图{x['n_shots']} 环境{x['n_env']}")
             print(f"        标题: {x['title']}")
             print(f"        判定依据: {x['reason']}  (难易={x['difficulty']}, 仓库={'+'.join(x['repos'])})")
+            print(f"        优先级: {x['priority']}（{x['pri_why']}；原表={x['priority_raw'] or '空'}）")
+            print(f"        查重键: v2={(x['fp2'] or '—')[:16]} v1={x['fp1'][:16]}"
+                  + ("  ⚠️v1兜底禁用(相撞)" if x['v1_ambiguous'] else "")
+                  + ("  ⚠️无截图,仅v1" if not x['fp2'] else ""))
 
-    print(f"\n数据源: {SHEET_URL}  子表=问题记录({SHEET_ID})")
-    print(f"总数据行(有问题描述): {stats['with_desc']}  |  命中(系统∈目标 且 未解决): {stats['matched']}")
-    print(f"  排除: 非目标系统 {stats['sys_off']} 条, 非未解决 {stats['not_unresolved']} 条")
-    print(f"  非目标系统分布(供陆叙确认 .jp 变体是否纳入): {stats['other_systems']}")
+    print(f"\n数据源: {SHEET_URL}  子表=问题记录({SHEET_ID})  已读到第 {MAX_ROW} 行")
+    print(f"总数据行(有描述或有截图): {stats['with_desc']}  |  命中(系统∈目标 且 进展∈口径): {stats['matched']}")
+    print(f"  排除: 非目标系统 {stats['sys_off']} 条, 进展不符 {stats['not_unresolved']} 条")
+    print(f"  非目标系统分布: {stats['other_systems']}")
+    print(f"  v1 指纹相撞的行(禁用 v1 兜底): {stats.get('v1_collided_rows') or '无'}")
+    print(f"  命中行里无截图(v2 不可算, 降级只用 v1): {stats.get('no_shot_rows') or '无'}")
     block("前端清单", fe)
     block("后端清单", be)
     block("不确定清单（不派人）", un)
     print(f"\n{'='*70}\n汇总: 前端 {len(fe)} / 后端 {len(be)} / 不确定 {len(un)}  (命中合计 {len(items)})")
     print(f"截图已下载至: {stats.get('tmpdir') or '(未下载, --no-download)'}\n")
+
+
+def print_skips(skips: list[dict]) -> None:
+    """跳过留痕（MYD-272 硬性要求）：跳过了哪些行、命中哪个键、撞上哪张单，
+    每轮都要打全。静默跳过会让「漏建」和「重复建」都变成无法追查的问题。"""
+    print(f"\n{'='*70}\n【本轮跳过明细】 {len(skips)} 行\n{'='*70}")
+    if not skips:
+        print("  （无跳过）")
+        return
+    for s in skips:
+        line = f"  行{s['row']:>3} | {s['reason']}"
+        if s.get("key"):
+            line += f" | 命中键={s['key']}"
+        if s.get("issue"):
+            line += f" | 已存在={s['issue']}"
+        print(line)
+        print(f"        标题: {s.get('title', '')}")
 
 
 # ── 下拉选项读取 & 回写（L/M 现为单选下拉，必须按选项值写，不能写自由文本）──────
@@ -475,6 +775,8 @@ AGENT_PM = "9277468f-5521-4ffd-b78f-f95dd7977ece"   # 项目主管docify
 
 
 def map_priority(feishu_pri: str) -> str:
+    """保留旧版本外壳（兼容 import 等），但 MYD-272 后 ——execute 不再用这个函数，
+    全走 assess_priority() 机械判定。"""
     return {"高": "high", "中": "medium", "低": "low",
             "P0": "urgent", "P1": "high", "P2": "medium", "P3": "low"}.get(
         (feishu_pri or "").strip(), "none")
@@ -577,8 +879,11 @@ def send_backend_digest_message(items: list, date_str: str, dry: bool) -> str | 
 
 
 def build_description(x: dict, kind: str) -> str:
-    """kind: 'formal'(正式处理单) / 'analysis'(分析问题单)。"""
+    """kind: 'formal'(正式处理单) / 'analysis'(分析问题单)。
+    MYD-272 强化：描述末尾加查重键溯源块（与 metadata 双写），描述为空的行明写
+    「需向测试补充复现步骤」——那几行只有截图，开发拿到单必须知道要回头问测试。"""
     repos = "、".join(x["repos"])
+    desc_body = x["desc"] or "_原表此行描述为空，需向测试补充复现步骤。请以附件截图为准。_"
     lines = [
         f"> 由飞书「问题记录」表自动建单 · [打开原表]({SHEET_URL}) · 行 {x['row']}",
         "",
@@ -586,10 +891,10 @@ def build_description(x: dict, kind: str) -> str:
         f"- **菜单**：{x['menu'] or '-'}　**问题分类**：{x['category'] or '-'}",
         f"- **前后端判定**：{x['cls']}（{x['reason']}）",
         f"- **难易**：{x['difficulty']}　**目标仓库**：{repos}",
-        f"- **优先级(原表)**：{x['priority'] or '-'}",
+        f"- **优先级**：{x['priority']}　（{x['pri_why']}；原表={x['priority_raw'] or '空'}）",
         "",
         "## 问题描述",
-        x["desc"] or "（无文字描述，见截图）",
+        desc_body,
         "",
         BRANCH_HINT,
         f"> 目标仓库：**{repos}**（99% 情况基于 `develop` 起支线）。",
@@ -605,18 +910,48 @@ def build_description(x: dict, kind: str) -> str:
         lines += ["", f"## 附件", f"- 问题截图 {x['n_shots']} 张、环境 {x['n_env']} 张（见附件区）"]
     if kind == "analysis":
         lines += ["", "> ⚠️ 归属不确定/较难，作为**分析问题单**：先分析定位，不预先派人，等授权后再转正式处理单。"]
+    # 溯源块：与 metadata 双写。metadata 用来精确查重，这段文本用来人工核对/历史比对。
+    lines += [
+        "",
+        "---",
+        "<!-- 自动建单溯源，请勿手改 -->",
+        f"- 查重主键 `{MK_FP2}`：`{x['fp2'] or '（该行无截图，v2 不可算，仅用 v1）'}`",
+        f"- 次级键 `{MK_FP1}`：`{x['fp1']}`",
+        f"- 行号（提示字段，可能因插行漂移）：`{x['row_key']}`",
+    ]
     return "\n".join(lines)
 
 
+def set_issue_metadata(issue_id: str, x: dict) -> None:
+    """把查重键写进 issue metadata。本地 state 会被 autopilot 每次 checkout 抹掉，
+    metadata 才是跨轮次的唯一真相，所以这里失败要出声。"""
+    kv: list[tuple[str, str, str]] = [
+        (MK_FP1, x["fp1"], "string"),
+        (MK_ROW, x["row_key"], "string"),
+        (MK_ROW_OK, "true", "bool"),
+    ]
+    if x["fp2"]:
+        kv.insert(0, (MK_FP2, x["fp2"], "string"))
+    for k, v, t in kv:
+        r = subprocess.run(["multica", "issue", "metadata", "set", issue_id,
+                            "--key", k, "--value", v, "--type", t],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log(f"⚠️ metadata 写入失败 {issue_id} {k}: {r.stderr.strip()[:200]}"
+                f"（下轮会因查不到而重复建单，需人工补）")
+
+
 def create_issue(x: dict, kind: str, dry: bool) -> str | None:
-    """建 Multica issue，返回 issue_id。正式处理单分配项目主管；分析单不派人。"""
+    """建 Multica issue，返回 issue_id。正式处理单分配项目主管；分析单不派人。
+    建单成功后立刻写 metadata 查重键——这是下一轮不重复建单的唯一依据。"""
     title = ("[前端]" if x["cls"] == "frontend" else "[后端]" if x["cls"] == "backend" else "[待定]") \
         + x["title"]
     title = title[:60]
-    priority = map_priority(x["priority"])
+    priority = x["priority"]          # MYD-272：机械口径判定，不取原表 J 列
     if dry:
-        log(f"[dry] 建单《{title}》 kind={kind} 分配={'项目主管' if kind=='formal' else '不派人'} "
-            f"附件={len(x['shots_local'])}")
+        log(f"[dry] 建单《{title}》 kind={kind} 优先级={priority}（{x['pri_why']}） "
+            f"分配={'项目主管' if kind=='formal' else '不派人'} 附件={len(x['shots_local'])} "
+            f"v2={(x['fp2'] or '—')[:12]} v1={x['fp1'][:12]}")
         return "dry-run-id"
     desc = build_description(x, kind)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8",
@@ -628,7 +963,7 @@ def create_issue(x: dict, kind: str, dry: bool) -> str | None:
            "--status", "todo", "--allow-duplicate", "--output", "json"]
     if kind == "formal":
         cmd += ["--assignee-id", AGENT_PM]
-    if priority != "none":
+    if priority:
         cmd += ["--priority", priority]
     for a in x["shots_local"]:
         cmd += ["--attachment", a]
@@ -640,7 +975,10 @@ def create_issue(x: dict, kind: str, dry: bool) -> str | None:
         out = r.stdout.strip()
         start = out.find("{")
         issue = json.loads(out[start:]) if start >= 0 else {}
-        return issue.get("id") or issue.get("identifier")
+        issue_id = issue.get("id") or issue.get("identifier")
+        if issue_id:
+            set_issue_metadata(issue_id, x)
+        return issue_id
     finally:
         try:
             os.unlink(desc_path)
@@ -655,6 +993,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="全链路自检（筛选/系统→仓库/难易/前后端 + 下拉选项可写性），不建单不写回")
     ap.add_argument("--no-download", action="store_true", help="跳过截图下载（更快）")
+    ap.add_argument("--no-dedup-check", action="store_true",
+                    help="只读模式下跳过平台侧查重预演（不查 multica issue list，纯离线看清单）")
     ap.add_argument("--json", action="store_true", help="额外输出 JSON 结果到 stdout")
     ap.add_argument("--execute", action="store_true",
                     help="真实建单 + 回写（需 L「丁」选项就绪；否则阻塞报错）。慎用。")
@@ -672,6 +1012,7 @@ def main() -> int:
         return 1
 
     tokens = TokenManager(app_id, app_secret)
+    probe_max_row(tokens)   # 行数每周在涨，写死会漏读尾部新行
 
     # 下拉选项可写性预检（三种模式都先查，报告里要用）
     l_options = fetch_list_options(tokens, "L")
@@ -702,6 +1043,33 @@ def main() -> int:
         log(f"读取电子表格 {SHEET_TOKEN} 子表 {SHEET_ID}（只读）")
         items, stats = collect(tokens, download=not args.no_download)
         print_report(items, stats)
+        # 只读模式也跑一遍查重预演：--execute 前就能看清哪些行会被跳过、跳过的理由。
+        if not args.no_dedup_check:
+            cand = [x for x in items
+                    if (x["cls"] != "uncertain" and x["difficulty"] == "easy"
+                        and x["dev"].strip() not in OTHER_OWNERS)
+                    or x["dev"].strip() in DING_VALUES]
+            skips, fresh = [], []
+            for x in cand:
+                if x["undedupable"]:
+                    skips.append({"row": x["row"], "title": x["title"],
+                                  "reason": "无法安全查重(无截图 且 v1 与其它行相撞) → 转人工"})
+                    continue
+                try:
+                    hit, key = find_existing(x)
+                except RuntimeError as e:
+                    log(f"查重预演中断：{e}")
+                    break
+                if hit:
+                    skips.append({"row": x["row"], "title": x["title"], "key": key,
+                                  "issue": f"{hit.get('identifier')}({hit.get('status')})",
+                                  "reason": "已建过单"})
+                else:
+                    fresh.append(x)
+            print_skips(skips)
+            print(f"\n【--execute 将新建】 {len(fresh)} 条：")
+            for x in fresh:
+                print(f"  行{x['row']:>3} | {x['priority']:<6} | {x['title']}")
         if not ding_ready:
             log("⚠️ 阻塞预警：L 下拉无「丁」选项，正式处理单无法回写 L，真实建单需等陆叙决策。")
         if args.json:
@@ -722,46 +1090,67 @@ def main() -> int:
         return 3
     log(f"真实模式：L 将写选项「{ding_val}」" + (f"（仅前 {args.limit} 条小样）" if args.limit else "（全量）"))
     items, stats = collect(tokens, download=not args.no_download)
-    # (1) 简单前端件：走正式处理单（原口径）。
-    easy = [x for x in items if x["cls"] != "uncertain" and x["difficulty"] == "easy"]
+    # (1) 简单前端件：走正式处理单（原口径）。但 MYD-272 约束：L 列已经写了别人名字
+    #     的行不抢（闫超/者俊/陈浩/冯志康 名下的 bug 不该由这条规则再派给丁）。
+    easy = [x for x in items if x["cls"] != "uncertain" and x["difficulty"] == "easy"
+            and x["dev"].strip() not in OTHER_OWNERS]
     # (2) 测试人员已在表里直接指派给【丁】、且未解决、尚未建单的问题：无论前后端难易，
     #     都建正式处理单跟踪调研+修复（陆叙 2026-08-13）。L 已是丁，仍回写 M=处理中 保证跨天幂等。
     ding_assigned = [x for x in items if x["dev"].strip() in DING_VALUES]
-    # 合并去重（按指纹），保持 easy 在前的顺序。
+    # 合并去重（按 v2，无 v2 退 v1），保持 easy 在前的顺序。
     seen_fp, todo = set(), []
     for x in easy + ding_assigned:
-        if x["fingerprint"] in seen_fp:
+        k = x["fp2"] or x["fp1"]
+        if k in seen_fp:
             continue
-        seen_fp.add(x["fingerprint"])
+        seen_fp.add(k)
         todo.append(x)
     if args.limit:
         todo = todo[:args.limit]
-    log(f"本次真实处理 {len(todo)} 条正式处理单"
-        f"（简单前端 {len(easy)} + 指派给丁 {len(ding_assigned)}，去重后 {len(todo)}）；"
+    log(f"本次候选 {len(todo)} 条正式处理单"
+        f"（简单前端 {len(easy)} + 指派给丁 {len(ding_assigned)}，同轮去重后 {len(todo)}）；"
         f"其余不派人不回写。")
     state = load_state()
+    skips: list[dict] = []
     done = 0
     for x in todo:
-        fp = x["fingerprint"]
-        if fp in state:
-            # 已存在 issue → 重置为 todo 交陆叙人工，不重复建单（幂等）。
-            log(f"  跳过(已建过) 行{x['row']} → {state[fp]}")
+        # ① 既无截图又与别的行 v1 相撞 → 两个键都不能唯一定位，自动建单会污染，转人工。
+        if x["undedupable"]:
+            skips.append({"row": x["row"], "title": x["title"],
+                          "reason": "无法安全查重(无截图 且 v1 与其它行相撞) → 转人工"})
+            continue
+        # ② 平台侧查重：v2 主键 → v1 兜底。查重本身失败就停，宁可不建也不重复建。
+        try:
+            hit, key = find_existing(x)
+        except RuntimeError as e:
+            log(f"❌ 查重失败，停止（已处理 {done} 条）：{e}")
+            print_skips(skips)
+            return 4
+        if hit:
+            skips.append({"row": x["row"], "title": x["title"], "key": key,
+                          "issue": f"{hit.get('identifier')}({hit.get('status')})",
+                          "reason": "已建过单"})
+            log(f"  跳过(已建过) 行{x['row']} 键={key} → {hit.get('identifier')}")
             continue
         issue_id = create_issue(x, "formal", dry=False)
         if not issue_id:
+            skips.append({"row": x["row"], "title": x["title"], "reason": "建单失败"})
             log(f"  建单失败，跳过回写：行{x['row']}")
             continue
-        state[fp] = issue_id
-        save_state(state)   # 建单成功即落 state，回写失败也不会重复建单
+        state[x["fp2"] or x["fp1"]] = issue_id
+        save_state(state)   # 仅本轮内兜底；跨轮次真相在 issue metadata
         try:
             write_back_row(tokens, x["row"], ding_val, in_progress=True, dry=False)
         except BlockedError as e:
             log(f"❌ 行{x['row']} 回写阻塞（issue={issue_id} 已建），停止：{e}")
+            print_skips(skips)
             return 3
         done += 1
-        log(f"  ✓ 行{x['row']} issue={issue_id} 已派项目主管，L={ding_val}/M={IN_PROGRESS}")
+        log(f"  ✓ 行{x['row']} issue={issue_id} 优先级={x['priority']} 已派项目主管，"
+            f"L={ding_val}/M={IN_PROGRESS}")
         time.sleep(0.3)
-    log(f"完成（真实）：处理 {done}/{len(todo)} 条正式处理单。")
+    print_skips(skips)   # MYD-272：每轮都要打全跳过明细，不允许静默跳过
+    log(f"完成（真实）：新建 {done} 条，跳过 {len(skips)} 条，候选合计 {len(todo)}。")
     return 0
 
 
