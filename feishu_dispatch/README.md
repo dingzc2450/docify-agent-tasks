@@ -112,7 +112,9 @@ python3 feishu_daily_dispatch.py --backend-digest --execute
 
 ## Autopilot
 
-- **测试BUG修复-前端派单(工作日)** `5ff11490` · cron `21 9 * * 1-5` Asia/Shanghai · `--execute`
-- **后端问题每日检查单** `034e4ca3` · cron `31 9 * * *` · `--backend-digest --execute`（发消息不建单）
+- **测试BUG修复-前端派单(工作日)** `5ff11490` · **active** · `--execute`
+  - 实际 cron 是 `TZ=Asia/Shanghai 21 0 * * 1-5`，也就是**工作日 00:21 CST（半夜）**，不是触发器 label 和这份文档以前写的「早 9:21」——`21 0` 的小时位是 0。查日志要按半夜那个时间点找。
+- **后端问题每日检查单** `034e4ca3` · **paused**（最后一次跑在 2026-08-26） · `--backend-digest --execute`（发消息不建单）
 - 都先 `multica repo checkout` 本私库再 `cd feishu_dispatch` 运行；避开 MYD-16 的 9:13。
+- ⚠️ autopilot 的 description 里还抄着一份旧口径（「派项目主管docify、回写 L=丁志诚 + M=处理中」）。跑的 agent 会把它当指令读，与现在的代码相冲，改代码口径时记得同步改它。
 - 环境变量 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 运行时注入，不入库。
