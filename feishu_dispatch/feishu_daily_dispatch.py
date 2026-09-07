@@ -45,6 +45,22 @@ MYD-272 定稿的建单规则（2026-09-07 并入本脚本，替换旧的本地 
      上调一档；dev/测试环境的行封顶 medium（不出 high），生产域名的行才可能到 high。
   5. 截图落地按 magic number 定扩展名（原表 PNG/JPEG 混用，文件名不可信）。
 
+MYD-272 复核后的第二轮修正（项目主管 2026-09-07 逐段看代码提的）：
+  6. **建单不派人、不回写飞书**。旧行为是每建一张单就 assign 项目主管，等于每建一张
+     就点起他一个 run，与「全部落地后集中分诊一轮」冲突；而建单即把原表 M 写成
+     「处理中」更是往测试在看的信息源里写了个不准的状态——那一刻根本没人开工。
+     现在：建单只建单，L/M 回写跟着**真实指派**走（--writeback-on-create 可恢复旧行为）。
+     代价是少了「M=处理中 自动排除」这层幂等，所以查重必须是硬的 → 见第 7 条。
+  7. **metadata 写不进去就当这轮失败**。查重键是建单之后单独写的，中间断掉那张单就
+     对查重永久隐形（历史上 59 张单就是这个下场）。现在写完立刻回读校验，失败则重试、
+     再失败就落进 .metadata_backfill_needed.json 并**中止本轮**；下轮启动先检查该文件，
+     非空直接阻塞，不允许带着窟窿继续建单。
+  8. **环境列为空按 dev 处理**（封顶 medium）。整轮都是 dev 阶段的测试发现，环境未知时
+     按生产放行会让「白屏」「崩溃」这类词直接判 high。
+  9. 前提（实测验证过，别改成「只查未关闭的单」）：`multica issue list --metadata`
+     **能查到已关闭的单**（done/cancelled 都精确返回）。整套查重的成立全靠这一点——
+     16 张单做完转 done 之后，下一轮扫表必须仍能查到它们，否则会全部重建一遍。
+
 环境变量：FEISHU_APP_ID / FEISHU_APP_SECRET
 
 用法：
@@ -403,6 +419,8 @@ MK_ROW_OK = "feishu_row_verified"    # bool，建单当刻核对过行号
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           ".daily_dispatch_state.json")
+METADATA_FAIL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  ".metadata_backfill_needed.json")
 
 
 def fingerprint_v1(system: str, menu: str, category: str, desc: str, date: str) -> str:
@@ -446,7 +464,13 @@ _dedup_cache: dict[str, list] = {}
 
 
 def query_issues_by_metadata(key: str, value: str) -> list[dict]:
-    """multica issue list --metadata k=v，精确查已建单。查不动 → 抛异常（宁可停也不重复建单）。"""
+    """multica issue list --metadata k=v，精确查已建单。查不动 → 抛异常（宁可停也不重复建单）。
+
+    **前提（项目主管 2026-09-07 实测确认）：--metadata 查询能查到已关闭的单**，
+    done / cancelled 都会精确返回（拿 MYD-165 done、MYD-11 cancelled 验证过）。
+    整套查重都压在这条上面——如果哪天平台改成默认只查开放单，所有已修完的历史问题
+    会瞬间变成「没建过」被重复建一遍。改动查询参数前先重验这一条。
+    """
     ck = f"{key}={value}"
     if ck in _dedup_cache:
         return _dedup_cache[ck]
@@ -524,10 +548,14 @@ _TIER = ["low", "medium", "high", "urgent"]
 
 def looks_dev_env(env: str, system: str) -> bool:
     """环境列是否指向 dev/测试。注意：232/233/241 的环境写的是「Docify.jp官网」——
-    那是生产域名不是 dev，不能一刀切封顶（MYD-272 里这条被专门纠过）。"""
+    那是生产域名不是 dev，不能一刀切封顶（MYD-272 里这条被专门纠过）。
+
+    环境列为空按 dev 处理（项目主管 2026-09-07）：这张表大多数行本来就是在测试环境
+    填的，空值更可能是「测试环境懒得填」而不是「生产」。判错方向要选代价小的一边——
+    误封顶只是少一档、分诊时能提回来；误按生产放行则是把 dev 的问题推成 high。"""
     e = (env or "").strip().lower()
     if not e:
-        return False
+        return True
     if "官网" in env or "docify.jp" in e.replace(" ", ""):
         return False
     return any(k in e for k in DEV_ENV_KW)
@@ -770,8 +798,9 @@ def write_back_row(tokens: TokenManager, row: int, ding_val: str, in_progress: b
 
 
 # ── 建单 ───────────────────────────────────────────────────────────────────
-# 正式处理单默认分配项目主管，由其按前后端逐单派人（本任务流程约定）。
-AGENT_PM = "9277468f-5521-4ffd-b78f-f95dd7977ece"   # 项目主管docify
+# 建单一律不派人：指派会立刻点起对方的 run（项目主管 2026-09-07）。留着这个 id
+# 只是为了分诊时人工引用，脚本不再自动写 --assignee-id。
+AGENT_PM = "9277468f-5521-4ffd-b78f-f95dd7977ece"   # 项目主管docify（供人工分诊引用）
 
 
 def map_priority(feishu_pri: str) -> str:
@@ -922,35 +951,96 @@ def build_description(x: dict, kind: str) -> str:
     return "\n".join(lines)
 
 
-def set_issue_metadata(issue_id: str, x: dict) -> None:
-    """把查重键写进 issue metadata。本地 state 会被 autopilot 每次 checkout 抹掉，
-    metadata 才是跨轮次的唯一真相，所以这里失败要出声。"""
-    kv: list[tuple[str, str, str]] = [
-        (MK_FP1, x["fp1"], "string"),
-        (MK_ROW, x["row_key"], "string"),
-        (MK_ROW_OK, "true", "bool"),
-    ]
+class MetadataWriteError(RuntimeError):
+    """查重键没能写进 issue metadata —— 那张单从此对查重隐形，必须中止本轮。"""
+
+
+def _metadata_kv(x: dict) -> list[tuple[str, str, str]]:
+    kv = [(MK_FP1, x["fp1"], "string"),
+          (MK_ROW, x["row_key"], "string"),
+          (MK_ROW_OK, "true", "bool")]
     if x["fp2"]:
         kv.insert(0, (MK_FP2, x["fp2"], "string"))
-    for k, v, t in kv:
-        r = subprocess.run(["multica", "issue", "metadata", "set", issue_id,
-                            "--key", k, "--value", v, "--type", t],
+    return kv
+
+
+def record_metadata_failure(issue_id: str, x: dict, err: str) -> None:
+    """把写失败的单落盘。下轮启动会先读这个文件，非空就阻塞——不允许带着窟窿继续建单。"""
+    try:
+        pend = json.load(open(METADATA_FAIL_FILE, encoding="utf-8"))
+    except (OSError, ValueError):
+        pend = []
+    pend.append({"issue": issue_id, "row": x["row"], "title": x["title"],
+                 "keys": {k: v for k, v, _ in _metadata_kv(x)},
+                 "error": err, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    try:
+        with open(METADATA_FAIL_FILE, "w", encoding="utf-8") as fh:
+            json.dump(pend, fh, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log(f"❌ 连失败清单都写不下去了（{e}），请立刻人工给 {issue_id} 补 metadata")
+
+
+def check_pending_metadata_failures() -> list:
+    try:
+        return json.load(open(METADATA_FAIL_FILE, encoding="utf-8")) or []
+    except (OSError, ValueError):
+        return []
+
+
+def set_issue_metadata(issue_id: str, x: dict, retries: int = 3) -> None:
+    """把查重键写进 issue metadata，写完**回读校验**。
+
+    这一步不是「尽力而为」：本地 state 会被 autopilot 每次 checkout 抹掉，建单又
+    不再回写 M=处理中，metadata 是唯一的跨轮次幂等来源。写漏一张 = 那张单永久隐形，
+    下轮必定重复建单（历史上 59 张单正是这个下场，靠 MYD-273 全量回填才补回来）。
+    所以失败要重试、重试完还不行就抛 MetadataWriteError 让调用方中止本轮。
+    """
+    kv = _metadata_kv(x)
+    last = ""
+    for attempt in range(retries):
+        bad = []
+        for k, v, t in kv:
+            r = subprocess.run(["multica", "issue", "metadata", "set", issue_id,
+                                "--key", k, "--value", v, "--type", t],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                bad.append(f"{k}: {r.stderr.strip()[:120]}")
+        # 回读校验：写入返回 0 不代表键真的在单上（沿用 L 列回读确认的同款保险）。
+        r = subprocess.run(["multica", "issue", "get", issue_id, "--output", "json"],
                            capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            log(f"⚠️ metadata 写入失败 {issue_id} {k}: {r.stderr.strip()[:200]}"
-                f"（下轮会因查不到而重复建单，需人工补）")
+        got = {}
+        if r.returncode == 0:
+            s = r.stdout.find("{")
+            got = (json.loads(r.stdout[s:]) if s >= 0 else {}).get("metadata") or {}
+        missing = [k for k, v, _ in kv if str(got.get(k, "")).lower() != str(v).lower()]
+        if not bad and not missing:
+            return
+        last = f"写入报错={bad or '无'} 回读缺失={missing}"
+        if attempt < retries - 1:
+            log(f"  metadata 写入未确认（{last}），{2 ** attempt}s 后重试")
+            time.sleep(2 ** attempt)
+    record_metadata_failure(issue_id, x, last)
+    raise MetadataWriteError(
+        f"{issue_id}（行{x['row']}）查重键写入失败：{last}。"
+        f"已记进 {os.path.basename(METADATA_FAIL_FILE)}，人工补齐前不要再跑 --execute。")
 
 
 def create_issue(x: dict, kind: str, dry: bool) -> str | None:
-    """建 Multica issue，返回 issue_id。正式处理单分配项目主管；分析单不派人。
-    建单成功后立刻写 metadata 查重键——这是下一轮不重复建单的唯一依据。"""
+    """建 Multica issue，返回 issue_id。
+
+    **建单不派人**（项目主管 2026-09-07）：`--assignee-id` + `--status todo` 的组合
+    会每建一张单就点起一次被指派 agent 的 run，和「一批全落地后做一轮集中分诊」的
+    约定冲突；首次对存量跑 --execute 会一次点起一串。分诊统一人工做一轮。
+
+    建单成功后立刻写 metadata 查重键——这是下一轮不重复建单的唯一依据，写不进去
+    直接抛 MetadataWriteError 中止本轮，不允许留下查不到的单。"""
     title = ("[前端]" if x["cls"] == "frontend" else "[后端]" if x["cls"] == "backend" else "[待定]") \
         + x["title"]
     title = title[:60]
     priority = x["priority"]          # MYD-272：机械口径判定，不取原表 J 列
     if dry:
         log(f"[dry] 建单《{title}》 kind={kind} 优先级={priority}（{x['pri_why']}） "
-            f"分配={'项目主管' if kind=='formal' else '不派人'} 附件={len(x['shots_local'])} "
+            f"分配=不派人(待集中分诊) 附件={len(x['shots_local'])} "
             f"v2={(x['fp2'] or '—')[:12]} v1={x['fp1'][:12]}")
         return "dry-run-id"
     desc = build_description(x, kind)
@@ -961,8 +1051,6 @@ def create_issue(x: dict, kind: str, dry: bool) -> str | None:
     cmd = ["multica", "issue", "create", "--title", title,
            "--description-file", desc_path, "--project", PROJECT_ID,
            "--status", "todo", "--allow-duplicate", "--output", "json"]
-    if kind == "formal":
-        cmd += ["--assignee-id", AGENT_PM]
     if priority:
         cmd += ["--priority", priority]
     for a in x["shots_local"]:
@@ -1004,7 +1092,23 @@ def main() -> int:
                     help="建一张后端问题检查单（未解决+处理中，含好不好改粗评，@陆叙），不逐条建单。"
                          "配合 --execute 才真实建单，否则 dry 预览。")
     ap.add_argument("--date", default="", help="检查单日期(YYYY-MM-DD)，默认取本机当天")
+    ap.add_argument("--writeback-on-create", action="store_true",
+                    help="建单时同步回写飞书 L=丁+M=处理中（默认不回写，M 跟着真实指派走）")
     args = ap.parse_args()
+
+    # 上一轮有单没写上查重键 → 它对查重隐形，这轮再跑必定重复建单。
+    # 先阻塞报警，人工补齐 metadata 并清空该文件后才允许继续（项目主管 2026-09-07）。
+    pending = check_pending_metadata_failures()
+    if pending:
+        log(f"❌ 阻塞：{len(pending)} 张单的查重键写入失败，未补齐前不建新单。"
+            f"明细见 {METADATA_FAIL_FILE}")
+        for p in pending:
+            log(f"   - {p.get('issue')} 行{p.get('row')} 《{p.get('title')}》 {p.get('error','')[:120]}")
+        log("   补法：multica issue metadata set <issue> --key <k> --value <v>；"
+            f"补完删掉 {os.path.basename(METADATA_FAIL_FILE)} 再跑。")
+        if args.execute:
+            return 6
+        log("   （只读模式继续，但 --execute 会被拒绝）")
 
     app_id, app_secret = os.environ.get("FEISHU_APP_ID"), os.environ.get("FEISHU_APP_SECRET")
     if not app_id or not app_secret:
@@ -1083,12 +1187,16 @@ def main() -> int:
         return 0
 
     # ── --execute 真实模式 ──
-    try:
-        ding_val = resolve_ding_write_value(l_options)   # 选项不就绪直接抛 BlockedError
-    except BlockedError as e:
-        log(f"❌ 阻塞，未做任何写入：{e}")
-        return 3
-    log(f"真实模式：L 将写选项「{ding_val}」" + (f"（仅前 {args.limit} 条小样）" if args.limit else "（全量）"))
+    # 不回写原表就不需要 L 选项就绪；只有回写时才做这项预检（项目主管 2026-09-07）。
+    ding_val = ""
+    if args.writeback_on_create:
+        try:
+            ding_val = resolve_ding_write_value(l_options)   # 选项不就绪直接抛 BlockedError
+        except BlockedError as e:
+            log(f"❌ 阻塞，未做任何写入：{e}")
+            return 3
+    log("真实模式：" + (f"L 将写选项「{ding_val}」" if args.writeback_on_create else "只建单，不回写原表 L/M")
+        + (f"（仅前 {args.limit} 条小样）" if args.limit else "（全量）"))
     items, stats = collect(tokens, download=not args.no_download)
     # (1) 简单前端件：走正式处理单（原口径）。但 MYD-272 约束：L 列已经写了别人名字
     #     的行不抢（闫超/者俊/陈浩/冯志康 名下的 bug 不该由这条规则再派给丁）。
@@ -1132,22 +1240,31 @@ def main() -> int:
                           "reason": "已建过单"})
             log(f"  跳过(已建过) 行{x['row']} 键={key} → {hit.get('identifier')}")
             continue
-        issue_id = create_issue(x, "formal", dry=False)
+        try:
+            issue_id = create_issue(x, "formal", dry=False)
+        except MetadataWriteError as e:
+            log(f"❌ {e}")
+            print_skips(skips)
+            return 5
         if not issue_id:
             skips.append({"row": x["row"], "title": x["title"], "reason": "建单失败"})
             log(f"  建单失败，跳过回写：行{x['row']}")
             continue
         state[x["fp2"] or x["fp1"]] = issue_id
         save_state(state)   # 仅本轮内兜底；跨轮次真相在 issue metadata
-        try:
-            write_back_row(tokens, x["row"], ding_val, in_progress=True, dry=False)
-        except BlockedError as e:
-            log(f"❌ 行{x['row']} 回写阻塞（issue={issue_id} 已建），停止：{e}")
-            print_skips(skips)
-            return 3
+        # 原表 L/M 是测试在看的信息源。建单 ≠ 有人开工，默认不回写「处理中」，
+        # 免得往别人的看板里塞一个不准的状态（项目主管 2026-09-07）；
+        # M 列应跟着真实指派走，分诊派人时再回写。
+        if args.writeback_on_create:
+            try:
+                write_back_row(tokens, x["row"], ding_val, in_progress=True, dry=False)
+            except BlockedError as e:
+                log(f"❌ 行{x['row']} 回写阻塞（issue={issue_id} 已建），停止：{e}")
+                print_skips(skips)
+                return 3
         done += 1
-        log(f"  ✓ 行{x['row']} issue={issue_id} 优先级={x['priority']} 已派项目主管，"
-            f"L={ding_val}/M={IN_PROGRESS}")
+        log(f"  ✓ 行{x['row']} issue={issue_id} 优先级={x['priority']} 未派人(待集中分诊)"
+            + (f"，L={ding_val}/M={IN_PROGRESS}" if args.writeback_on_create else "，未回写原表"))
         time.sleep(0.3)
     print_skips(skips)   # MYD-272：每轮都要打全跳过明细，不允许静默跳过
     log(f"完成（真实）：新建 {done} 条，跳过 {len(skips)} 条，候选合计 {len(todo)}。")
