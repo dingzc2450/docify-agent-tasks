@@ -52,14 +52,25 @@ MYD-272 复核后的第二轮修正（项目主管 2026-09-07 逐段看代码提
      现在：建单只建单，L/M 回写跟着**真实指派**走（--writeback-on-create 可恢复旧行为）。
      代价是少了「M=处理中 自动排除」这层幂等，所以查重必须是硬的 → 见第 7 条。
   7. **metadata 写不进去就当这轮失败**。查重键是建单之后单独写的，中间断掉那张单就
-     对查重永久隐形（历史上 59 张单就是这个下场）。现在写完立刻回读校验，失败则重试、
-     再失败就落进 .metadata_backfill_needed.json 并**中止本轮**；下轮启动先检查该文件，
-     非空直接阻塞，不允许带着窟窿继续建单。
+     对前两层查重隐形（历史上 59 张单就是这个下场）。现在写完立刻回读校验，失败则重试、
+     再失败就落进 .metadata_backfill_needed.json 并**中止本轮**。注意那个文件是
+     会话级的（随 checkout 消失），只当人工在场时的提前报警用 → 真正的兜底见第 10 条。
   8. **环境列为空按 dev 处理**（封顶 medium）。整轮都是 dev 阶段的测试发现，环境未知时
      按生产放行会让「白屏」「崩溃」这类词直接判 high。
   9. 前提（实测验证过，别改成「只查未关闭的单」）：`multica issue list --metadata`
      **能查到已关闭的单**（done/cancelled 都精确返回）。整套查重的成立全靠这一点——
      16 张单做完转 done 之后，下一轮扫表必须仍能查到它们，否则会全部重建一遍。
+
+MYD-272 第三轮修正（项目主管 2026-09-07 指出闸门放错了地方）：
+ 10. **查重加第三层：描述溯源块兜底**。第 7 条的失败清单放在本地目录，而本地文件
+     会被 autopilot 每次 checkout 抹掉——防止重复建单的最后一道闸门，反而比它守护的
+     metadata 更脆弱。闭合的失效路径是：建单成功 → metadata 写失败 → 记本地文件 →
+     中止；下轮 checkout 文件没了 → 检查放行 → 两层 metadata 双双 miss → 静默重建。
+     根治办法是让**孤儿单自己认领自己**：建单时描述里已经写了 fp1/fp2 溯源块，那段
+     文本跟 issue 是**同一个 create 调用原子落地**的，不存在「建了单但键没写上」的
+     窗口。所以 metadata 两层都 miss 时，再翻页拉全量 issue、按指纹搜一遍描述；命中
+     就顺手把 metadata 补回去。闸门因此退化成锦上添花，不再是唯一防线。
+     翻页是硬要求：--limit 默认 50、服务端封顶 100，一页拉不完会静默漏。
 
 环境变量：FEISHU_APP_ID / FEISHU_APP_SECRET
 
@@ -421,6 +432,11 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           ".daily_dispatch_state.json")
 METADATA_FAIL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".metadata_backfill_needed.json")
+# 注意：这个文件在 autopilot 每次重新 checkout 本仓时会被抹掉，和 STATE_FILE
+# 一样是会话级的。曾经它是防止重复建单的最后一道闸门，但现在 find_existing 的
+# 第三层（描述溯源块）提供了跨轮次可靠的兜底——指纹串跟 issue 在同一个 create
+# 调用里原子落地，不需要单独的文件来记载。所以这个文件现在是**锦上添花**：
+# 人工在场时能提前报警，无人值守时闸门失效了也不至于重复建单（会被第三层认领）。
 
 
 def fingerprint_v1(system: str, menu: str, category: str, desc: str, date: str) -> str:
@@ -486,24 +502,97 @@ def query_issues_by_metadata(key: str, value: str) -> list[dict]:
     return issues
 
 
+_desc_index: list[dict] | None = None
+
+
+def load_issue_descriptions() -> list[dict]:
+    """把全工作区 issue 的描述拉一遍（翻页拉全），每轮只拉一次、缓存复用。
+
+    这是**第三层兜底专用**的全量索引，正常查重仍走 metadata 精确查（`--metadata k=v`），
+    不要拿它替代前两层——那样每轮都要拖全量数据，且查重精度反而更差。
+    翻页是必须的：`--limit` 默认 50、服务端封顶 100，一页拉不完就会静默漏。
+    """
+    global _desc_index
+    if _desc_index is not None:
+        return _desc_index
+    issues: list[dict] = []
+    offset = 0
+    while True:
+        r = subprocess.run(["multica", "issue", "list", "--limit", "100",
+                            "--offset", str(offset), "--output", "json"],
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"拉取 issue 全量索引失败(offset={offset}): {r.stderr.strip()[:200]}")
+        s = r.stdout.find("{")
+        page = json.loads(r.stdout[s:]) if s >= 0 else {}
+        batch = page.get("issues") or []
+        issues += batch
+        if not page.get("has_more") or not batch:
+            break
+        offset += len(batch)
+        if offset > 20000:      # 防跑飞：真到这个量级说明分页参数出问题了
+            raise RuntimeError("issue 全量索引翻页超过 20000 条，疑似分页失效，停止")
+    _desc_index = issues
+    log(f"  已建单描述索引：{len(issues)} 张（第三层兜底用，本轮只拉一次）")
+    return _desc_index
+
+
+def find_in_descriptions(key: str, fp: str) -> list[dict]:
+    """在 issue 描述正文的「自动建单溯源」块里找指纹。
+
+    匹配的是 build_description 渲染出来的整行（`键`：`指纹`），不是裸 sha1 子串——
+    MYD-272/273 这类讨论单的正文里会原样引用指纹，裸搜会把讨论单当成问题单命中，
+    然后**静默漏建**一张真问题单。多一个键名前缀就能把讨论单排除掉。
+    """
+    if not fp:
+        return []
+    needle = f"`{key}`：`{fp}`"
+    return [i for i in load_issue_descriptions() if needle in (i.get("description") or "")]
+
+
 def find_existing(x: dict) -> tuple[dict | None, str]:
-    """按 v2 → v1 顺序查已建单。返回 (issue|None, 命中的键名/未命中原因)。
+    """按 v2 → v1 → 描述溯源块 三层查已建单。返回 (issue|None, 命中的键名/未命中原因)。
 
     规则来源 MYD-272：
       · v2 优先：含截图 fileToken，实测全表唯一。
       · v1 兜底：截图被重传会换 token → v2 假阴性，必须再查一次 v1。
       · v1 相撞的行（同系统/菜单/分类且描述为空的那几行）**禁用 v1 兜底**，
         否则会把邻行的单当成自己的单而漏建。
+
+    第三层「描述溯源块」是**孤儿单的自救通道**（项目主管 2026-09-07 提的）：
+    metadata 是建单之后另一次 API 调用写的，中间断掉就会留下一张有单无键的孤儿单，
+    对前两层完全隐形、下轮必被重复建。而描述里的指纹串是**跟 issue 在同一个
+    create 调用里原子落地的**——不存在「建了单但键没写上」的窗口，所以两层 metadata
+    都 miss 时再按指纹搜一遍描述，孤儿单就能自己认领自己。命中后顺手把 metadata
+    补回去（补不上也不致命，下轮这层还会再兜住它）。
     """
     if x["fp2"]:
         hit = query_issues_by_metadata(MK_FP2, x["fp2"])
         if hit:
             return hit[0], MK_FP2
+    if not x["v1_ambiguous"]:
+        hit = query_issues_by_metadata(MK_FP1, x["fp1"])
+        if hit:
+            return hit[0], MK_FP1
+    # ── 第三层：描述正文里的溯源块。v2 精确，v1 沿用同一条相撞禁用规则。
+    for key, fp, why in ((MK_FP2, x["fp2"], "描述溯源块(v2)"),
+                         (MK_FP1, None if x["v1_ambiguous"] else x["fp1"], "描述溯源块(v1)")):
+        found = find_in_descriptions(key, fp)
+        if found:
+            iss = found[0]
+            if len(found) > 1:
+                log(f"  ⚠️ 行{x['row']} 描述兜底命中 {len(found)} 张"
+                    f"（{', '.join(i.get('identifier','?') for i in found)}），取第一张")
+            log(f"  ↺ 行{x['row']} metadata 查不到但描述里有指纹 → 孤儿单 {iss.get('identifier')}，"
+                f"补写 metadata")
+            try:
+                set_issue_metadata(iss["id"], x, record_failure=False)
+            except MetadataWriteError as e:
+                log(f"  ⚠️ 孤儿单 {iss.get('identifier')} metadata 补写仍失败：{e}"
+                    f"（不致命：下轮描述兜底还会兜住它）")
+            return iss, why
     if x["v1_ambiguous"]:
-        return None, "v1兜底已禁用(该行v1指纹与其它行相撞)"
-    hit = query_issues_by_metadata(MK_FP1, x["fp1"])
-    if hit:
-        return hit[0], MK_FP1
+        return None, "未命中(该行v1与其它行相撞，v1兜底已禁用，仅查了v2)"
     return None, "未命中"
 
 
@@ -965,7 +1054,12 @@ def _metadata_kv(x: dict) -> list[tuple[str, str, str]]:
 
 
 def record_metadata_failure(issue_id: str, x: dict, err: str) -> None:
-    """把写失败的单落盘。下轮启动会先读这个文件，非空就阻塞——不允许带着窟窿继续建单。"""
+    """把写失败的单落盘，供人工在场时提前报警。
+
+    **不要把它当跨轮次的闸门**：文件在 autopilot 下一次 checkout 时就没了，
+    见 METADATA_FAIL_FILE 处的说明。真正跨轮次兜住孤儿单的是 find_existing 的
+    第三层描述兜底。
+    """
     try:
         pend = json.load(open(METADATA_FAIL_FILE, encoding="utf-8"))
     except (OSError, ValueError):
@@ -987,13 +1081,18 @@ def check_pending_metadata_failures() -> list:
         return []
 
 
-def set_issue_metadata(issue_id: str, x: dict, retries: int = 3) -> None:
+def set_issue_metadata(issue_id: str, x: dict, retries: int = 3,
+                       record_failure: bool = True) -> None:
     """把查重键写进 issue metadata，写完**回读校验**。
 
     这一步不是「尽力而为」：本地 state 会被 autopilot 每次 checkout 抹掉，建单又
-    不再回写 M=处理中，metadata 是唯一的跨轮次幂等来源。写漏一张 = 那张单永久隐形，
-    下轮必定重复建单（历史上 59 张单正是这个下场，靠 MYD-273 全量回填才补回来）。
-    所以失败要重试、重试完还不行就抛 MetadataWriteError 让调用方中止本轮。
+    不再回写 M=处理中，metadata 是跨轮次最主要的幂等来源。写漏一张 = 那张单对前两层
+    查重隐形（历史上 59 张单正是这个下场，靠 MYD-273 全量回填才补回来），只能靠
+    find_existing 第三层的描述兜底捞回来。所以失败要重试、重试完还不行就抛
+    MetadataWriteError 让调用方中止本轮。
+
+    `record_failure=False` 用于 find_existing 里给孤儿单补写键的场景：那条路径本来
+    就是兜底修复，补不上也不该反过来把下一轮拦死。
     """
     kv = _metadata_kv(x)
     last = ""
@@ -1019,10 +1118,13 @@ def set_issue_metadata(issue_id: str, x: dict, retries: int = 3) -> None:
         if attempt < retries - 1:
             log(f"  metadata 写入未确认（{last}），{2 ** attempt}s 后重试")
             time.sleep(2 ** attempt)
-    record_metadata_failure(issue_id, x, last)
+    if record_failure:
+        record_metadata_failure(issue_id, x, last)
     raise MetadataWriteError(
         f"{issue_id}（行{x['row']}）查重键写入失败：{last}。"
-        f"已记进 {os.path.basename(METADATA_FAIL_FILE)}，人工补齐前不要再跑 --execute。")
+        f"已记进 {os.path.basename(METADATA_FAIL_FILE)}，人工补齐前不要再跑 --execute。"
+        if record_failure else
+        f"{issue_id}（行{x['row']}）查重键补写失败：{last}")
 
 
 def create_issue(x: dict, kind: str, dry: bool) -> str | None:
@@ -1096,8 +1198,9 @@ def main() -> int:
                     help="建单时同步回写飞书 L=丁+M=处理中（默认不回写，M 跟着真实指派走）")
     args = ap.parse_args()
 
-    # 上一轮有单没写上查重键 → 它对查重隐形，这轮再跑必定重复建单。
-    # 先阻塞报警，人工补齐 metadata 并清空该文件后才允许继续（项目主管 2026-09-07）。
+    # 上一轮有单没写上查重键 → 它对前两层查重隐形。这里提前报警让人工补齐。
+    # 只在同一台机器上连续跑时有效（文件会随 checkout 消失），跨轮次真正兜住这种
+    # 孤儿单的是 find_existing 第三层的描述兜底，不是这个闸门。
     pending = check_pending_metadata_failures()
     if pending:
         log(f"❌ 阻塞：{len(pending)} 张单的查重键写入失败，未补齐前不建新单。"
