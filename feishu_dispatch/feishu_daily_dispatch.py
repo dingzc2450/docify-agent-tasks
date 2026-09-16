@@ -46,9 +46,9 @@ MYD-272 定稿的建单规则（2026-09-07 并入本脚本，替换旧的本地 
   5. 截图落地按 magic number 定扩展名（原表 PNG/JPEG 混用，文件名不可信）。
 
 MYD-272 复核后的第二轮修正（项目主管 2026-09-07 逐段看代码提的）：
-  6. **建单不派人、不回写飞书**（「不派人」已于 2026-09-16 被陆叙口径推翻：建单即派
-     【项目疯狂开发小队】，leader 项目主管docify 分诊后派给具体开发；--no-assign 可回旧行为。
-     「不回写飞书 L/M」仍然有效）。旧行为是每建一张单就 assign 项目主管，等于每建一张
+  6. **建单不派人、不回写飞书**（「不派人」在 2026-09-16 经历两轮：先被陆叙改为建单即派
+     【项目疯狂开发小队】，同日又改为「不派人 + 末尾出清单由主管批量分诊」（每单一 run 太吵）；
+     --assign-squad 可回每单即派。「不回写飞书 L/M」始终有效）。旧行为是每建一张单就 assign 项目主管，等于每建一张
      就点起他一个 run，与「全部落地后集中分诊一轮」冲突；而建单即把原表 M 写成
      「处理中」更是往测试在看的信息源里写了个不准的状态——那一刻根本没人开工。
      现在：建单只建单，L/M 回写跟着**真实指派**走（--writeback-on-create 可恢复旧行为）。
@@ -889,9 +889,12 @@ def write_back_row(tokens: TokenManager, row: int, ding_val: str, in_progress: b
 
 
 # ── 建单 ───────────────────────────────────────────────────────────────────
-# 旧口径（项目主管 2026-09-07）：建单一律不派人，怕每建一张单就点起一次 run。
-# 新口径（陆叙 2026-09-16）：建单即派给【项目疯狂开发小队】——squad 指派只路由到
-# leader（项目主管docify），由主管判断派给哪个开发人员，补上「建完没人接」这一步。
+# 现行口径（陆叙 2026-09-16 第二轮）：**建单不派人，批量分诊**。每建一张单就派小队
+# 会每张单点起一次主管 run，太吵；改为建单只建单，脚本末尾打印「本轮新建清单」，
+# autopilot 的当次 run（项目主管docify）拿清单一次性批量分诊：简单→直接派开发修复，
+# 复杂→先派开发调研，调研结论回来再决定要不要实现。
+# 沿革：2026-09-07 建单不派人 → 2026-09-16 建单即派小队（每单一 run，太吵）→
+#       2026-09-16 当天改为批量分诊。--assign-squad 可恢复「每单即派」旧行为。
 SQUAD_ID = "4ecb04f8-24cc-4f56-9a85-4c32b008475c"   # 项目疯狂开发小队（leader=项目主管docify）
 AGENT_PM = "9277468f-5521-4ffd-b78f-f95dd7977ece"   # 项目主管docify（squad leader，供引用）
 
@@ -1131,13 +1134,12 @@ def set_issue_metadata(issue_id: str, x: dict, retries: int = 3,
         f"{issue_id}（行{x['row']}）查重键补写失败：{last}")
 
 
-def create_issue(x: dict, kind: str, dry: bool, assign: bool = True) -> str | None:
-    """建 Multica issue，返回 issue_id。
+def create_issue(x: dict, kind: str, dry: bool, assign: bool = False) -> dict | None:
+    """建 Multica issue，返回平台返回的 issue dict（失败/ dry 返回 None）。
 
-    **建单即派 squad**（陆叙 2026-09-16）：`--assignee-id` 指到【项目疯狂开发小队】，
-    squad 指派只路由到 leader（项目主管docify），由主管分诊后派给具体开发，
-    补上「建完没人接」这一步。旧的「建单不派人」口径（项目主管 2026-09-07）作废；
-    需要回到旧行为时用 --no-assign。
+    **建单不派人，批量分诊**（陆叙 2026-09-16 第二轮）：默认不带 assignee，
+    本轮所有新单由 autopilot 当次 run 的主管拿末尾的「本轮新建清单」一次性
+    批量分诊。`--assign-squad` 才恢复「每建一张单就派小队」的旧行为（每单一 run，太吵）。
 
     建单成功后立刻写 metadata 查重键——这是下一轮不重复建单的唯一依据，写不进去
     直接抛 MetadataWriteError 中止本轮，不允许留下查不到的单。"""
@@ -1147,10 +1149,10 @@ def create_issue(x: dict, kind: str, dry: bool, assign: bool = True) -> str | No
     priority = x["priority"]          # MYD-272：机械口径判定，不取原表 J 列
     if dry:
         log(f"[dry] 建单《{title}》 kind={kind} 优先级={priority}（{x['pri_why']}） "
-            f"分配={'项目疯狂开发小队(→项目主管分诊)' if assign else '不派人(--no-assign)'} "
+            f"分配={'项目疯狂开发小队(--assign-squad)' if assign else '不派人(待批量分诊)'} "
             f"附件={len(x['shots_local'])} "
             f"v2={(x['fp2'] or '—')[:12]} v1={x['fp1'][:12]}")
-        return "dry-run-id"
+        return None
     desc = build_description(x, kind)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8",
                                      dir=os.getcwd()) as tf:
@@ -1176,7 +1178,7 @@ def create_issue(x: dict, kind: str, dry: bool, assign: bool = True) -> str | No
         issue_id = issue.get("id") or issue.get("identifier")
         if issue_id:
             set_issue_metadata(issue_id, x)
-        return issue_id
+        return issue if issue_id else None
     finally:
         try:
             os.unlink(desc_path)
@@ -1204,8 +1206,9 @@ def main() -> int:
     ap.add_argument("--date", default="", help="检查单日期(YYYY-MM-DD)，默认取本机当天")
     ap.add_argument("--writeback-on-create", action="store_true",
                     help="建单时同步回写飞书 L=丁+M=处理中（默认不回写，M 跟着真实指派走）")
-    ap.add_argument("--no-assign", action="store_true",
-                    help="建单不派人（默认派给项目疯狂开发小队，由项目主管docify分诊派给开发）")
+    ap.add_argument("--assign-squad", action="store_true",
+                    help="每建一张单就派项目疯狂开发小队（每单一 run，太吵）。默认不派："
+                         "本轮新单由主管在跑完后拿「本轮新建清单」批量分诊")
     args = ap.parse_args()
 
     # 上一轮有单没写上查重键 → 它对前两层查重隐形。这里提前报警让人工补齐。
@@ -1333,6 +1336,7 @@ def main() -> int:
         f"其余不派人不回写。")
     state = load_state()
     skips: list[dict] = []
+    created: list[dict] = []   # 本轮新建单明细，末尾汇总给批量分诊用
     done = 0
     for x in todo:
         # ① 既无截图又与别的行 v1 相撞 → 两个键都不能唯一定位，自动建单会污染，转人工。
@@ -1354,15 +1358,18 @@ def main() -> int:
             log(f"  跳过(已建过) 行{x['row']} 键={key} → {hit.get('identifier')}")
             continue
         try:
-            issue_id = create_issue(x, "formal", dry=False, assign=not args.no_assign)
+            issue = create_issue(x, "formal", dry=False, assign=args.assign_squad)
         except MetadataWriteError as e:
             log(f"❌ {e}")
             print_skips(skips)
             return 5
+        issue_id = (issue or {}).get("id") or (issue or {}).get("identifier")
         if not issue_id:
             skips.append({"row": x["row"], "title": x["title"], "reason": "建单失败"})
             log(f"  建单失败，跳过回写：行{x['row']}")
             continue
+        created.append({"id": issue_id, "identifier": issue.get("identifier") or issue_id,
+                        "x": x})
         state[x["fp2"] or x["fp1"]] = issue_id
         save_state(state)   # 仅本轮内兜底；跨轮次真相在 issue metadata
         # 原表 L/M 是测试在看的信息源。建单 ≠ 有人开工，默认不回写「处理中」，
@@ -1377,11 +1384,22 @@ def main() -> int:
                 return 3
         done += 1
         log(f"  ✓ 行{x['row']} issue={issue_id} 优先级={x['priority']} "
-            + ("已派项目疯狂开发小队(→项目主管分诊)" if not args.no_assign else "未派人(--no-assign)")
+            + ("已派项目疯狂开发小队(--assign-squad)" if args.assign_squad else "未派人(待批量分诊)")
             + (f"，L={ding_val}/M={IN_PROGRESS}" if args.writeback_on_create else "，未回写原表"))
         time.sleep(0.3)
     print_skips(skips)   # MYD-272：每轮都要打全跳过明细，不允许静默跳过
     log(f"完成（真实）：新建 {done} 条，跳过 {len(skips)} 条，候选合计 {len(todo)}。")
+    # ── 本轮新建清单：批量分诊的唯一输入（陆叙 2026-09-16 第二轮）──
+    # autopilot 当次 run 的主管（项目主管docify）拿这段清单逐张分诊：
+    # 简单→直接派开发修复；复杂/存疑→先派开发调研，调研结论回来再决定要不要实现。
+    # 脚本的难易判定只是启发式参考，主管可推翻。不派人时这段清单就是交接物，别删。
+    if created and not args.assign_squad:
+        log("── 本轮新建清单（供批量分诊）──")
+        for c in created:
+            cx = c["x"]
+            log(f"  {c['identifier']} | id={c['id']} | 行{cx['row']} | {cx['cls']}"
+                f" | 脚本判难易={cx['difficulty']} | {cx['priority']} | {cx['title']}")
+        log("分诊口径：简单→直接派修复；复杂/存疑→先派调研，结论回来再决定实现与否。")
     return 0
 
 
