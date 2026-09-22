@@ -38,7 +38,8 @@ python3 sync_issues.py --execute    # 正式同步（dry-run 结果确认后再�
     与前端信号同时命中算冲突 → **不自动指派**（宁可少派不错派），留 todo 人工分拣。
 - **附件**：工单正文里内嵌的 `/attachments/<uuid>` 图片会带 token 下载，
   建单时一并挂到 Multica issue 附件区；描述里同时保留 Gitea 绝对直链兜底。
-- **指派**：前端工单建单即派陆叙；其余不派人。
+- **指派**：前端工单建单即派 `frontend_rules.json` 的 `frontend_assignee`（当前=前端开发者 agent；
+  链路：前端开发者修复提 PR → Gitea 专家验收 → 陆叙终审合并）；其余不派人。
 - **单向**：Gitea → Multica；Gitea 侧关闭不反向同步（二期再评估）。
 
 ## 查询/建单工具 gitea_issue_tool.py

@@ -12,7 +12,8 @@
          不能当真相（主管 2026-09-21 明确：状态文件以平台侧标记为准、本地为辅）。
   · 前端识别：frontend_rules.json 配置化。label 命中 → 前端；无 label 按关键词，
     前后端信号同时命中算冲突 → 不自动指派（宁可少派不错派，主管口径）。
-  · 指派：识别为前端的工单建单即派陆叙（zhicheng.ding）；其余不派人留 todo 人工分拣。
+  · 指派：识别为前端的工单建单即派前端开发者（2026-09-22 链路调整：前端开发者修复
+    提 PR → Gitea 专家验收 → 陆叙终审合并）；其余不派人留 todo 人工分拣。
   · 只做 Gitea → Multica 单向；Gitea 侧关闭不反向同步（二期再评估）。
 
 用法：
@@ -35,7 +36,8 @@ import gitea_client as gitea
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 PROJECT_ID = "dd5c9377-979c-4ec1-bce0-00ea289175e5"          # docify 项目
-LUXU_MEMBER_ID = "5f4f6c9b-7675-44c9-9394-82fee107a79a"      # 陆叙（zhicheng.ding）
+# 前端工单建单即派目标：2026-09-22 起为前端开发者 agent（链路：前端开发者修复提 PR
+# → Gitea 专家验收 → 陆叙终审合并）。目标写在 frontend_rules.json 的 frontend_assignee。
 
 # metadata 键名是跨轮次契约，改名等于全量重建单，不要动。
 MK_GITEA = "gitea_issue"          # 值：docify/docify-agent#<number>
@@ -230,15 +232,16 @@ def set_issue_metadata(issue_id: str, number: int, retries: int = 3) -> None:
 
 
 def create_issue(issue: dict, cls: str, reason: str, dry: bool,
-                 attachments: list[str] | None = None) -> dict | None:
-    """建 Multica issue；前端件建单即派陆叙。dry 模式只打印不建。"""
+                 attachments: list[str] | None = None,
+                 assignee: dict | None = None) -> dict | None:
+    """建 Multica issue；前端件建单即派 assignee（frontend_rules.json 配置）。dry 只打印。"""
     attachments = attachments or []
     number = issue["number"]
     title = ("[前端]" if cls == "frontend" else "") + issue["title"].strip()
     title = title[:60]
-    assign = cls == "frontend"
+    assign = cls == "frontend" and assignee
     if dry:
-        log(f"[dry] 建单《{title}》 指派={'陆叙' if assign else '不派(留todo)'}（{reason}）"
+        log(f"[dry] 建单《{title}》 指派={assignee['name'] if assign else '不派(留todo)'}（{reason}）"
             f" 附件={len(attachments)}")
         return None
     desc = build_description(issue, cls, reason, len(attachments))
@@ -250,7 +253,7 @@ def create_issue(issue: dict, cls: str, reason: str, dry: bool,
            "--description-file", desc_path, "--project", PROJECT_ID,
            "--status", "todo", "--allow-duplicate", "--output", "json"]
     if assign:
-        cmd += ["--assignee-id", LUXU_MEMBER_ID]
+        cmd += ["--assignee-id", assignee["id"]]
     for a in attachments:
         cmd += ["--attachment", a]
     try:
@@ -282,6 +285,7 @@ def main() -> int:
         args.dry_run = True
 
     rules = load_rules()
+    assignee_name = rules["frontend_assignee"]["name"]
     state = load_state()
     issues = gitea.list_open_issues(state="open")
     log(f"Gitea {gitea.OWNER}/{gitea.REPO} open 工单 {len(issues)} 张")
@@ -317,10 +321,10 @@ def main() -> int:
     # ── 汇总输出 ──
     fe = [f for f in fresh if f["cls"] == "frontend"]
     un = [f for f in fresh if f["cls"] != "frontend"]
-    print(f"\n{'='*70}\n【本轮将新建】 {len(fresh)} 张（前端派陆叙 {len(fe)} / 不指派 {len(un)}）\n{'='*70}")
+    print(f"\n{'='*70}\n【本轮将新建】 {len(fresh)} 张（前端派{assignee_name} {len(fe)} / 不指派 {len(un)}）\n{'='*70}")
     for f in fresh:
         i = f["issue"]
-        print(f"  #{i['number']:>3} | {'→陆叙' if f['cls']=='frontend' else ' 留todo'} "
+        print(f"  #{i['number']:>3} | {'→'+assignee_name if f['cls']=='frontend' else ' 留todo'} "
               f"| 附件{len(f['attachments'])} | {i['title'][:50]}")
         print(f"        判定: {f['reason']}")
     print(f"\n{'='*70}\n【本轮跳过(已同步)】 {len(skips)} 张\n{'='*70}")
@@ -329,7 +333,7 @@ def main() -> int:
         print(f"        标题: {s['title'][:50]}")
 
     if args.dry_run:
-        log(f"DRY-RUN 完成：将新建 {len(fresh)} 张（派陆叙 {len(fe)} 张），跳过 {len(skips)} 张。"
+        log(f"DRY-RUN 完成：将新建 {len(fresh)} 张（派{assignee_name} {len(fe)} 张），跳过 {len(skips)} 张。"
             f"确认无误后用 --execute 正式同步。")
         return 0
 
@@ -339,7 +343,8 @@ def main() -> int:
         i = f["issue"]
         try:
             made = create_issue(i, f["cls"], f["reason"], dry=False,
-                                attachments=f["attachments"])
+                                attachments=f["attachments"],
+                                assignee=rules.get("frontend_assignee"))
         except MetadataWriteError as e:
             log(f"❌ {e}，中止本轮（已建 {len(created)} 张）")
             save_state(state)
@@ -353,7 +358,7 @@ def main() -> int:
                         "cls": f["cls"], "title": i["title"]})
         state[gitea_key(i["number"])] = {"status": "created", "issue": ident}
         log(f"  ✓ #{i['number']} → {ident}"
-            + ("，已派陆叙" if f["cls"] == "frontend" else "，留 todo 待人工分拣"))
+            + (f"，已派{assignee_name}" if f["cls"] == "frontend" else "，留 todo 待人工分拣"))
         time.sleep(0.3)
     state["last_sync_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     save_state(state)
