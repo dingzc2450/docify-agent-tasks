@@ -15,7 +15,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BASE = "https://code.docify.jp/api/v1"
+SITE = "https://code.docify.jp"
+BASE = f"{SITE}/api/v1"
 OWNER = "docify"
 REPO = "docify-agent"
 
@@ -35,8 +36,8 @@ def get_token() -> str:
     return tok
 
 
-def request(method: str, path: str, body: dict | None = None,
-            max_retries: int = 4) -> tuple[dict | list, dict]:
+def api_request(method: str, path: str, body: dict | None = None,
+                max_retries: int = 4) -> tuple[dict | list, dict]:
     """发请求，返回 (json_payload, response_headers)。
 
     429 读 Retry-After、5xx 指数退避；4xx（除 429）直接抛错不重试。
@@ -60,7 +61,10 @@ def request(method: str, path: str, body: dict | None = None,
             except Exception:  # noqa: BLE001
                 pass
             if e.code == 429 and attempt < max_retries - 1:
-                wait = int(e.headers.get("Retry-After") or 2 ** attempt)
+                try:
+                    wait = int(e.headers.get("Retry-After") or 2 ** attempt)
+                except ValueError:
+                    wait = 2 ** attempt   # Retry-After 也可能是 HTTP-date，按秒数兜底
                 log(f"HTTP 429 限流，{wait}s 后重试 ({attempt + 1}/{max_retries})")
                 time.sleep(wait)
                 continue
@@ -91,7 +95,7 @@ def list_open_issues(state: str = "open", limit: int = 50) -> list[dict]:
     while True:
         q = urllib.parse.urlencode({"state": state, "type": "issues",
                                     "limit": limit, "page": page})
-        batch, _ = request("GET", f"/repos/{OWNER}/{REPO}/issues?{q}")
+        batch, _ = api_request("GET", f"/repos/{OWNER}/{REPO}/issues?{q}")
         if not batch:
             break
         issues += batch
@@ -107,14 +111,16 @@ def list_labels() -> list[dict]:
     labels: list[dict] = []
     page = 1
     while True:
-        batch, _ = request("GET",
-                           f"/repos/{OWNER}/{REPO}/labels?limit=50&page={page}")
+        batch, _ = api_request("GET",
+                               f"/repos/{OWNER}/{REPO}/labels?limit=50&page={page}")
         if not batch:
             break
         labels += batch
         if len(batch) < 50:
             break
         page += 1
+        if page > 100:   # 防跑飞，与 list_open_issues 一致
+            raise GiteaError("标签翻页超过 100 页，疑似分页失效，停止")
     return labels
 
 
@@ -122,12 +128,12 @@ def create_issue(title: str, body: str, label_ids: list[int] | None = None) -> d
     payload: dict = {"title": title, "body": body}
     if label_ids:
         payload["labels"] = label_ids
-    issue, _ = request("POST", f"/repos/{OWNER}/{REPO}/issues", body=payload)
+    issue, _ = api_request("POST", f"/repos/{OWNER}/{REPO}/issues", body=payload)
     return issue
 
 
 def create_label(name: str, color: str = "#1f6feb") -> dict:
-    label, _ = request("POST", f"/repos/{OWNER}/{REPO}/labels",
+    label, _ = api_request("POST", f"/repos/{OWNER}/{REPO}/labels",
                        body={"name": name, "color": color})
     return label
 
@@ -140,7 +146,6 @@ def issue_html_url(number: int) -> str:
 # 实测（2026-09-22）：单工单 GET 返回的 attachments 字段为 null，但正文里以
 # markdown 图片形式内嵌 /attachments/<uuid> 相对链接；下载必须带 token（不带 404）。
 ATTACHMENT_RE = re.compile(r"\((/attachments/[0-9a-fA-F-]+)\)")
-SITE = "https://code.docify.jp"
 
 IMAGE_MAGIC = [(b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
                (b"GIF8", ".gif"), (b"RIFF", ".webp"), (b"BM", ".bmp")]

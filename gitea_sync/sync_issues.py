@@ -21,8 +21,11 @@
 """
 
 import argparse
+import atexit
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,6 +57,15 @@ def load_rules() -> dict:
         return json.load(fh)
 
 
+def _kw_hit(keyword: str, text: str) -> bool:
+    """关键词匹配：纯 ASCII 词（api/500/UI/CSS 等）按词边界 + 大小写不敏感，
+    避免 "500px"/"1500"/"build" 里的 "ui" 这类误命中；中文词保持子串匹配。"""
+    if keyword.isascii():
+        pat = rf"(?<![A-Za-z0-9]){re.escape(keyword.lower())}(?![A-Za-z0-9])"
+        return re.search(pat, text.lower()) is not None
+    return keyword in text
+
+
 def classify(issue: dict, rules: dict) -> tuple[str, str]:
     """返回 (frontend|unknown, 依据)。冲突/无信号都归 unknown（不自动指派）。"""
     labels = [l.get("name", "") for l in issue.get("labels") or []]
@@ -62,9 +74,9 @@ def classify(issue: dict, rules: dict) -> tuple[str, str]:
         return "frontend", f"命中前端标签: {'、'.join(hit_labels)}"
 
     text = f"{issue.get('title', '')}\n{issue.get('body') or ''}"
-    fe = [k for k in rules["frontend_keywords"] if k in text]
-    hard = [k for k in rules["backend_keywords_hard"] if k in text]
-    soft = [k for k in rules["backend_keywords_soft"] if k in text]
+    fe = [k for k in rules["frontend_keywords"] if _kw_hit(k, text)]
+    hard = [k for k in rules["backend_keywords_hard"] if _kw_hit(k, text)]
+    soft = [k for k in rules["backend_keywords_soft"] if _kw_hit(k, text)]
     # 软后端词（越权/密码/api 类）只在没有前端信号时生效（主管 2026-09-22 确认：
     # #91 主题色、#94 提示文案是前端件，不该被这类词拦下）；硬后端词任何时候都算数。
     be = hard if fe else hard + soft
@@ -82,6 +94,12 @@ def gitea_key(number: int) -> str:
     return f"{gitea.OWNER}/{gitea.REPO}#{number}"
 
 
+def _parse_json_stdout(stdout: str) -> dict:
+    """multica CLI 的 stdout 前面可能带非 JSON 前缀，从第一个 { 起解析。"""
+    s = stdout.find("{")
+    return json.loads(stdout[s:]) if s >= 0 else {}
+
+
 def query_issues_by_metadata(key: str, value: str) -> list[dict]:
     """multica issue list --metadata k=v 精确查。查不动 → 抛异常（宁可停也不重复建单）。"""
     r = subprocess.run(["multica", "issue", "list", "--metadata", f"{key}={value}",
@@ -89,9 +107,7 @@ def query_issues_by_metadata(key: str, value: str) -> list[dict]:
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"查重失败 {key}={value}: {r.stderr.strip()[:200]}")
-    out = r.stdout.strip()
-    s = out.find("{")
-    return (json.loads(out[s:]) if s >= 0 else {}).get("issues") or []
+    return _parse_json_stdout(r.stdout.strip()).get("issues") or []
 
 
 _desc_index: list[dict] | None = None
@@ -110,8 +126,7 @@ def load_issue_descriptions() -> list[dict]:
                            capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             raise RuntimeError(f"拉取 issue 全量索引失败(offset={offset}): {r.stderr.strip()[:200]}")
-        s = r.stdout.find("{")
-        page = json.loads(r.stdout[s:]) if s >= 0 else {}
+        page = _parse_json_stdout(r.stdout)
         batch = page.get("issues") or []
         issues += batch
         if not page.get("has_more") or not batch:
@@ -204,8 +219,7 @@ def set_issue_metadata(issue_id: str, number: int, retries: int = 3) -> None:
                            capture_output=True, text=True, timeout=120)
         got = {}
         if r.returncode == 0:
-            s = r.stdout.find("{")
-            got = (json.loads(r.stdout[s:]) if s >= 0 else {}).get("metadata") or {}
+            got = _parse_json_stdout(r.stdout).get("metadata") or {}
         if not bad and str(got.get(MK_GITEA, "")) == value:
             return
         last = f"写入报错={bad or '无'} 回读值={got.get(MK_GITEA)!r}"
@@ -244,9 +258,7 @@ def create_issue(issue: dict, cls: str, reason: str, dry: bool,
         if r.returncode != 0:
             log(f"建单失败《{title}》: {r.stderr.strip()[:300]}")
             return None
-        out = r.stdout.strip()
-        s = out.find("{")
-        created = json.loads(out[s:]) if s >= 0 else {}
+        created = _parse_json_stdout(r.stdout.strip())
         issue_id = created.get("id") or created.get("identifier")
         if issue_id:
             set_issue_metadata(issue_id, number)
@@ -274,6 +286,8 @@ def main() -> int:
     issues = gitea.list_open_issues(state="open")
     log(f"Gitea {gitea.OWNER}/{gitea.REPO} open 工单 {len(issues)} 张")
     tmpdir = tempfile.mkdtemp(prefix="gitea_att_", dir=os.getcwd())
+    # 任何退出路径（正常/早退/异常）都清掉附件临时目录，不留在 cwd
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
 
     skips: list[dict] = []
     fresh: list[dict] = []
