@@ -1,3 +1,5 @@
 # 本地辅助状态文件：只是同轮加速/人工查看用，跨轮次真相在 issue metadata，不入库
 .sync_state.json
 __pycache__/
+# 附件下载临时目录
+gitea_att_*/

@@ -33,7 +33,11 @@ python3 sync_issues.py --execute    # 正式同步（dry-run 结果确认后再�
 - **前端识别**（`frontend_rules.json` 配置化，改清单不改代码）：
   - Gitea label 命中 `frontend_labels` → 前端；
   - 无 label 时按关键词匹配标题+正文：只中前端词 → 前端；
-  - 前后端信号同时命中 / 无信号 → **不自动指派**（宁可少派不错派），留 todo 人工分拣。
+  - 软后端词（`backend_keywords_soft`：越权/密码/api 类）只在没有前端信号时生效；
+    硬后端词（`backend_keywords_hard`：接口/500/数据库 类）任何时候都算数，
+    与前端信号同时命中算冲突 → **不自动指派**（宁可少派不错派），留 todo 人工分拣。
+- **附件**：工单正文里内嵌的 `/attachments/<uuid>` 图片会带 token 下载，
+  建单时一并挂到 Multica issue 附件区；描述里同时保留 Gitea 绝对直链兜底。
 - **指派**：前端工单建单即派陆叙；其余不派人。
 - **单向**：Gitea → Multica；Gitea 侧关闭不反向同步（二期再评估）。
 

@@ -63,7 +63,11 @@ def classify(issue: dict, rules: dict) -> tuple[str, str]:
 
     text = f"{issue.get('title', '')}\n{issue.get('body') or ''}"
     fe = [k for k in rules["frontend_keywords"] if k in text]
-    be = [k for k in rules["backend_keywords"] if k in text]
+    hard = [k for k in rules["backend_keywords_hard"] if k in text]
+    soft = [k for k in rules["backend_keywords_soft"] if k in text]
+    # 软后端词（越权/密码/api 类）只在没有前端信号时生效（主管 2026-09-22 确认：
+    # #91 主题色、#94 提示文案是前端件，不该被这类词拦下）；硬后端词任何时候都算数。
+    be = hard if fe else hard + soft
     if fe and not be:
         return "frontend", "命中前端关键词: " + "、".join(fe[:5])
     if fe and be:
@@ -159,10 +163,12 @@ def save_state(state: dict) -> None:
 
 
 # ── 建单 ────────────────────────────────────────────────────────────────────
-def build_description(issue: dict, cls: str, reason: str) -> str:
+def build_description(issue: dict, cls: str, reason: str, n_attachments: int) -> str:
     number = issue["number"]
     url = gitea.issue_html_url(number)
-    body = (issue.get("body") or "").strip() or "_（Gitea 原文为空）_"
+    # 正文里的相对附件链接改写成 Gitea 绝对直链（兜底：即使附件上传失败也能溯源）
+    body = gitea.absolutize_attachment_links((issue.get("body") or "").strip()) \
+           or "_（Gitea 原文为空）_"
     labels = [l.get("name", "") for l in issue.get("labels") or []]
     lines = [
         f"> 由 Gitea 工单自动同步 · [打开原工单]({url}) · 更新于 {issue.get('updated_at', '')[:10]}",
@@ -173,6 +179,10 @@ def build_description(issue: dict, cls: str, reason: str) -> str:
         "",
         "## 工单原文",
         body,
+    ]
+    if n_attachments:
+        lines += ["", "## 附件", f"- 原工单截图 {n_attachments} 张（见附件区，辅助调试修复）"]
+    lines += [
         "",
         "---",
         "<!-- 自动同步溯源，请勿手改 -->",
@@ -205,16 +215,19 @@ def set_issue_metadata(issue_id: str, number: int, retries: int = 3) -> None:
     raise MetadataWriteError(f"{issue_id}（#{number}）查重键写入失败：{last}")
 
 
-def create_issue(issue: dict, cls: str, reason: str, dry: bool) -> dict | None:
+def create_issue(issue: dict, cls: str, reason: str, dry: bool,
+                 attachments: list[str] | None = None) -> dict | None:
     """建 Multica issue；前端件建单即派陆叙。dry 模式只打印不建。"""
+    attachments = attachments or []
     number = issue["number"]
     title = ("[前端]" if cls == "frontend" else "") + issue["title"].strip()
     title = title[:60]
     assign = cls == "frontend"
     if dry:
-        log(f"[dry] 建单《{title}》 指派={'陆叙' if assign else '不派(留todo)'}（{reason}）")
+        log(f"[dry] 建单《{title}》 指派={'陆叙' if assign else '不派(留todo)'}（{reason}）"
+            f" 附件={len(attachments)}")
         return None
-    desc = build_description(issue, cls, reason)
+    desc = build_description(issue, cls, reason, len(attachments))
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8",
                                      dir=os.getcwd()) as tf:
         tf.write(desc)
@@ -224,6 +237,8 @@ def create_issue(issue: dict, cls: str, reason: str, dry: bool) -> dict | None:
            "--status", "todo", "--allow-duplicate", "--output", "json"]
     if assign:
         cmd += ["--assignee-id", LUXU_MEMBER_ID]
+    for a in attachments:
+        cmd += ["--attachment", a]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
@@ -258,6 +273,7 @@ def main() -> int:
     state = load_state()
     issues = gitea.list_open_issues(state="open")
     log(f"Gitea {gitea.OWNER}/{gitea.REPO} open 工单 {len(issues)} 张")
+    tmpdir = tempfile.mkdtemp(prefix="gitea_att_", dir=os.getcwd())
 
     skips: list[dict] = []
     fresh: list[dict] = []
@@ -274,7 +290,13 @@ def main() -> int:
                           "issue": f"{hit.get('identifier')}({hit.get('status')})"})
             log(f"  跳过(已同步) #{number} 键={key} → {hit.get('identifier')}")
             continue
-        fresh.append({"issue": issue, "cls": cls, "reason": reason})
+        # 附件：从正文抽 /attachments/<uuid> 链接下载（dry-run 也下载，验证附件行为）
+        atts = []
+        for i, path in enumerate(gitea.extract_attachment_paths(issue.get("body") or "")):
+            local = gitea.download_attachment(path, tmpdir, f"i{number}_{i+1}")
+            if local:
+                atts.append(local)
+        fresh.append({"issue": issue, "cls": cls, "reason": reason, "attachments": atts})
         # 本地辅助记录（真相在平台 metadata，这里只加速同轮判断/人工查看）
         state[gitea_key(number)] = {"status": "pending_create"}
 
@@ -284,7 +306,8 @@ def main() -> int:
     print(f"\n{'='*70}\n【本轮将新建】 {len(fresh)} 张（前端派陆叙 {len(fe)} / 不指派 {len(un)}）\n{'='*70}")
     for f in fresh:
         i = f["issue"]
-        print(f"  #{i['number']:>3} | {'→陆叙' if f['cls']=='frontend' else ' 留todo'} | {i['title'][:50]}")
+        print(f"  #{i['number']:>3} | {'→陆叙' if f['cls']=='frontend' else ' 留todo'} "
+              f"| 附件{len(f['attachments'])} | {i['title'][:50]}")
         print(f"        判定: {f['reason']}")
     print(f"\n{'='*70}\n【本轮跳过(已同步)】 {len(skips)} 张\n{'='*70}")
     for s in skips:
@@ -301,7 +324,8 @@ def main() -> int:
     for f in fresh:
         i = f["issue"]
         try:
-            made = create_issue(i, f["cls"], f["reason"], dry=False)
+            made = create_issue(i, f["cls"], f["reason"], dry=False,
+                                attachments=f["attachments"])
         except MetadataWriteError as e:
             log(f"❌ {e}，中止本轮（已建 {len(created)} 张）")
             save_state(state)

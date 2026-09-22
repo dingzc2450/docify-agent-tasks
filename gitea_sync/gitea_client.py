@@ -8,6 +8,7 @@ token 不入库、不入日志——报错信息里也只带 HTTP 状态码和 G
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -133,3 +134,48 @@ def create_label(name: str, color: str = "#1f6feb") -> dict:
 
 def issue_html_url(number: int) -> str:
     return f"https://code.docify.jp/{OWNER}/{REPO}/issues/{number}"
+
+
+# ── 附件 ────────────────────────────────────────────────────────────────────
+# 实测（2026-09-22）：单工单 GET 返回的 attachments 字段为 null，但正文里以
+# markdown 图片形式内嵌 /attachments/<uuid> 相对链接；下载必须带 token（不带 404）。
+ATTACHMENT_RE = re.compile(r"\((/attachments/[0-9a-fA-F-]+)\)")
+SITE = "https://code.docify.jp"
+
+IMAGE_MAGIC = [(b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+               (b"GIF8", ".gif"), (b"RIFF", ".webp"), (b"BM", ".bmp")]
+
+
+def extract_attachment_paths(body: str) -> list[str]:
+    """从工单正文抽 /attachments/<uuid> 相对路径（markdown 图片/链接）。"""
+    return ATTACHMENT_RE.findall(body or "")
+
+
+def absolutize_attachment_links(body: str) -> str:
+    """把正文里的相对附件链接改写成绝对地址，作为描述里的 Gitea 直链兜底。"""
+    return ATTACHMENT_RE.sub(f"({SITE}\\1)", body or "")
+
+
+def download_attachment(path: str, dest_dir: str, prefix: str) -> str | None:
+    """下载一个附件到 dest_dir，返回本地路径；失败返回 None（不阻塞建单）。
+
+    扩展名按 magic number 定（URL 只有 uuid 没有文件名，且不带 token 会得到 404
+    错误页而不是图片）——沿用 feishu_dispatch 踩过的坑：按内容校验，非图片/下载
+    失败直接丢弃并留日志。
+    """
+    url = f"{SITE}{path}"
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"token {get_token()}"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            blob = resp.read()
+    except (urllib.error.URLError, TimeoutError) as e:
+        log(f"附件下载失败 {path}: {e}")
+        return None
+    ext = next((ext for sig, ext in IMAGE_MAGIC if blob.startswith(sig)), "")
+    if not ext:
+        log(f"附件内容不是可识别图片，丢弃 {path}: {blob[:80]!r}")
+        return None
+    local = os.path.join(dest_dir, f"{prefix}{ext}")
+    with open(local, "wb") as fh:
+        fh.write(blob)
+    return local
