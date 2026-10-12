@@ -48,10 +48,11 @@ MYD-272 定稿的建单规则（2026-09-07 并入本脚本，替换旧的本地 
 MYD-272 复核后的第二轮修正（项目主管 2026-09-07 逐段看代码提的）：
   6. **建单不派人、不回写飞书**（「不派人」在 2026-09-16 经历两轮：先被陆叙改为建单即派
      【项目疯狂开发小队】，同日又改为「不派人 + 末尾出清单由主管批量分诊」（每单一 run 太吵）；
-     --assign-squad 可回每单即派。「不回写飞书 L/M」始终有效）。旧行为是每建一张单就 assign 项目主管，等于每建一张
+     --assign-squad 可回每单即派。「不回写飞书 L/M」——其中 M 的部分已在 MYD-333
+     被陆叙恢复为「建单即回写 M=处理中」，见文末；L 仍不默认回写）。旧行为是每建一张单就 assign 项目主管，等于每建一张
      就点起他一个 run，与「全部落地后集中分诊一轮」冲突；而建单即把原表 M 写成
      「处理中」更是往测试在看的信息源里写了个不准的状态——那一刻根本没人开工。
-     现在：建单只建单，L/M 回写跟着**真实指派**走（--writeback-on-create 可恢复旧行为）。
+     现在：建单只建单，L 回写跟着**真实指派**走。
      代价是少了「M=处理中 自动排除」这层幂等，所以查重必须是硬的 → 见第 7 条。
   7. **metadata 写不进去就当这轮失败**。查重键是建单之后单独写的，中间断掉那张单就
      对前两层查重隐形（历史上 59 张单就是这个下场）。现在写完立刻回读校验，失败则重试、
@@ -73,6 +74,20 @@ MYD-272 第三轮修正（项目主管 2026-09-07 指出闸门放错了地方）
      窗口。所以 metadata 两层都 miss 时，再翻页拉全量 issue、按指纹搜一遍描述；命中
      就顺手把 metadata 补回去。闸门因此退化成锦上添花，不再是唯一防线。
      翻页是硬要求：--limit 默认 50、服务端封顶 100，一页拉不完会静默漏。
+
+MYD-333（陆叙 2026-10-12）：**恢复「建单成功即回写 M=处理中」**。
+  第 6 条「建单不回写 L/M」里 M 的部分被推翻：测试以原表 M【解决进展】为准看进度，
+  建单后停在【未解决】等于告诉测试没人处理。现行口径：
+    · 建单成功（metadata 查重键落妥）后立即把该行 M 写成「处理中」；
+    · 写前重读该行 A~N 重算 v1 指纹核对——行号会因上方插行漂移（行 158 实证），
+      collect 到回写之间表被动过就会写错行，指纹不一致则不写并报警；
+    · 写完回读确认落成下拉选项而非自由文本（M 现为单选下拉，「处理中」是合法选项，
+      2026-10-12 实测选项含 已解决/未解决/处理中/待确认 等 11 项）；
+    · 「处理中」不在 M 下拉选项里 → 不写并报警（不破坏下拉校验，交陆叙检查配置）；
+    · M 回写失败**不中止本轮**——三层硬查重已保证幂等，末尾统一汇总失败明细报警。
+    · L=丁志诚 仍**不默认回写**，--writeback-on-create 才写（只写 L，M 已由上面处理）。
+  副作用是「M=处理中 自动排除」这层幂等也跟着回来了：已建单的行下轮直接被
+  「进展=未解决」筛选排除，三层硬查重继续兜底。
 
 环境变量：FEISHU_APP_ID / FEISHU_APP_SECRET
 
@@ -875,7 +890,9 @@ def read_cell(tokens: TokenManager, col: str, row: int) -> str:
 
 def write_back_row(tokens: TokenManager, row: int, ding_val: str, in_progress: bool,
                    dry: bool) -> None:
-    """正式处理单：L=丁选项 + M=处理中；写完抽样回读确认落成选项而非文本。"""
+    """正式处理单：回写 L=丁选项（--writeback-on-create 专用；M 自 MYD-333 起由
+    write_progress_cell 在建单成功时默认回写，in_progress 仅作兼容保留）。
+    写完抽样回读确认落成选项而非文本。"""
     if dry:
         log(f"[dry] 回写 行{row} L={ding_val}" + (f" M={IN_PROGRESS}" if in_progress else ""))
         return
@@ -886,6 +903,36 @@ def write_back_row(tokens: TokenManager, row: int, ding_val: str, in_progress: b
     if got_l != ding_val:
         raise BlockedError(f"行{row} L 回读={got_l!r} != 期望{ding_val!r}，可能未落成下拉选项，停止。")
     log(f"  ✓ 行{row} L 回读确认={got_l}" + (f"，M→{IN_PROGRESS}" if in_progress else ""))
+
+
+def write_progress_cell(tokens: TokenManager, x: dict) -> None:
+    """建单成功后回写该行 M=处理中（MYD-333，陆叙 2026-10-12：测试以 M 列看进度，
+    停在【未解决】等于没人处理）。
+
+    两道保险：
+      · 写前重读该行 A~N、重算 v1 指纹与建单时比对——行号会因上方插行漂移
+        （行 158 实证），collect 到回写之间原表被动过就会写错行；指纹不一致
+        说明行号已漂移，拒绝落笔（抛 BlockedError，由调用方汇总报警）。
+      · 写完回读 M 确认落成下拉选项「处理中」而非自由文本（同 L 列回读的保险）。
+    """
+    row = x["row"]
+    rng = f"{SHEET_ID}!A{row}:N{row}"
+    p = _request("GET",
+                 f"/sheets/v2/spreadsheets/{SHEET_TOKEN}/values/{rng}"
+                 f"?valueRenderOption=UnformattedValue", token=tokens.get())
+    vals = p["data"]["valueRange"].get("values") or []
+    cur = vals[0] if vals else []
+    fp_now = fingerprint_v1(fp_text(get(cur, COL_SYS)), fp_text(get(cur, COL_MENU)),
+                            fp_text(get(cur, COL_CAT)), fp_text(get(cur, COL_DESC)),
+                            fp_date(get(cur, COL_DATE)))
+    if fp_now != x["fp1"]:
+        raise BlockedError(
+            f"行{row} 回写前核对失败：表内当前内容指纹与建单时不一致（行号疑似漂移），"
+            f"为避免写错行，跳过 M 回写。")
+    write_cell(tokens, "M", row, IN_PROGRESS)
+    got = read_cell(tokens, "M", row)
+    if got != IN_PROGRESS:
+        raise BlockedError(f"行{row} M 回读={got!r} != 期望{IN_PROGRESS!r}，可能未落成下拉选项。")
 
 
 # ── 建单 ───────────────────────────────────────────────────────────────────
@@ -1205,7 +1252,7 @@ def main() -> int:
                          "配合 --execute 才真实建单，否则 dry 预览。")
     ap.add_argument("--date", default="", help="检查单日期(YYYY-MM-DD)，默认取本机当天")
     ap.add_argument("--writeback-on-create", action="store_true",
-                    help="建单时同步回写飞书 L=丁+M=处理中（默认不回写，M 跟着真实指派走）")
+                    help="建单时额外回写飞书 L=丁志诚（M=处理中 自 MYD-333 起默认回写，无需此旗标）")
     ap.add_argument("--assign-squad", action="store_true",
                     help="每建一张单就派项目疯狂开发小队（每单一 run，太吵）。默认不派："
                          "本轮新单由主管在跑完后拿「本轮新建清单」批量分诊")
@@ -1240,6 +1287,12 @@ def main() -> int:
     log(f"L(开发) 下拉选项={l_options}")
     log(f"M(解决进展) 下拉选项={m_options}")
     ding_ready = any(v in l_options for v in DING_WRITE_PREFERENCE)
+    # MYD-333：建单成功默认回写 M=处理中，前提是它是 M 下拉的合法选项；
+    # 不在选项里就整轮不写并报警（写非法值会破坏下拉校验），交陆叙检查列配置。
+    m_write_ready = IN_PROGRESS in m_options
+    if not m_write_ready:
+        log(f"⚠️ M(解决进展) 下拉选项里没有「{IN_PROGRESS}」（现有={m_options}），"
+            f"建单后将无法回写进度状态——请陆叙在飞书检查该列选项配置。")
 
     # ── 后端检查单模式（不逐条建单，汇总一张）──
     if args.backend_digest:
@@ -1311,7 +1364,9 @@ def main() -> int:
         except BlockedError as e:
             log(f"❌ 阻塞，未做任何写入：{e}")
             return 3
-    log("真实模式：" + (f"L 将写选项「{ding_val}」" if args.writeback_on_create else "只建单，不回写原表 L/M")
+    log("真实模式：" + (f"建单成功即回写 M={IN_PROGRESS}" if m_write_ready
+                       else "建单后 M 不回写（选项缺失，见上方警告）")
+        + (f"，L 将写选项「{ding_val}」" if args.writeback_on_create else "，不回写 L")
         + (f"（仅前 {args.limit} 条小样）" if args.limit else "（全量）"))
     items, stats = collect(tokens, download=not args.no_download)
     # (1) 简单前端件：走正式处理单（原口径）。但 MYD-272 约束：L 列已经写了别人名字
@@ -1337,6 +1392,7 @@ def main() -> int:
     state = load_state()
     skips: list[dict] = []
     created: list[dict] = []   # 本轮新建单明细，末尾汇总给批量分诊用
+    writeback_failed: list[dict] = []   # M 回写失败明细（单已建妥），末尾统一报警
     done = 0
     for x in todo:
         # ① 既无截图又与别的行 v1 相撞 → 两个键都不能唯一定位，自动建单会污染，转人工。
@@ -1372,23 +1428,40 @@ def main() -> int:
                         "x": x})
         state[x["fp2"] or x["fp1"]] = issue_id
         save_state(state)   # 仅本轮内兜底；跨轮次真相在 issue metadata
-        # 原表 L/M 是测试在看的信息源。建单 ≠ 有人开工，默认不回写「处理中」，
-        # 免得往别人的看板里塞一个不准的状态（项目主管 2026-09-07）；
-        # M 列应跟着真实指派走，分诊派人时再回写。
+        # 建单成功即回写 M=处理中（MYD-333，陆叙 2026-10-12）：测试以原表 M 列看进度，
+        # 停在【未解决】等于告诉测试没人处理。写前重读行指纹核对防漂移、写完回读确认。
+        # 回写失败不中止本轮——三层硬查重已保证幂等，末尾统一汇总失败明细报警。
+        m_written = False
+        if m_write_ready:
+            try:
+                write_progress_cell(tokens, x)
+                m_written = True
+            except (BlockedError, RuntimeError) as e:
+                log(f"  ❌ 行{x['row']} M 回写失败（issue={issue_id} 已建，不中止）：{e}")
+                writeback_failed.append({"row": x["row"],
+                                         "issue": issue.get("identifier") or issue_id,
+                                         "error": str(e)[:200]})
+        # L=丁志诚 仍只在 --writeback-on-create 时回写（M 已由上面处理，这里只写 L）。
         if args.writeback_on_create:
             try:
-                write_back_row(tokens, x["row"], ding_val, in_progress=True, dry=False)
+                write_back_row(tokens, x["row"], ding_val, in_progress=False, dry=False)
             except BlockedError as e:
-                log(f"❌ 行{x['row']} 回写阻塞（issue={issue_id} 已建），停止：{e}")
+                log(f"❌ 行{x['row']} L 回写阻塞（issue={issue_id} 已建），停止：{e}")
                 print_skips(skips)
                 return 3
         done += 1
         log(f"  ✓ 行{x['row']} issue={issue_id} 优先级={x['priority']} "
             + ("已派项目疯狂开发小队(--assign-squad)" if args.assign_squad else "未派人(待批量分诊)")
-            + (f"，L={ding_val}/M={IN_PROGRESS}" if args.writeback_on_create else "，未回写原表"))
+            + (f"，M={IN_PROGRESS}" if m_written else "，M 未回写")
+            + (f"，L={ding_val}" if args.writeback_on_create else ""))
         time.sleep(0.3)
     print_skips(skips)   # MYD-272：每轮都要打全跳过明细，不允许静默跳过
     log(f"完成（真实）：新建 {done} 条，跳过 {len(skips)} 条，候选合计 {len(todo)}。")
+    if writeback_failed:
+        log(f"⚠️ 本轮 {len(writeback_failed)} 行 M 回写失败（issue 已建妥，"
+            f"需人工把原表对应行 M 改为「{IN_PROGRESS}」）：")
+        for f in writeback_failed:
+            log(f"   - 行{f['row']} {f['issue']}: {f['error'][:150]}")
     # ── 本轮新建清单：批量分诊的唯一输入（陆叙 2026-09-16 第二轮）──
     # autopilot 当次 run 的主管（项目主管docify）拿这段清单逐张分诊：
     # 简单→直接派开发修复；复杂/存疑→先派开发调研，调研结论回来再决定要不要实现。

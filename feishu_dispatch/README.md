@@ -15,10 +15,10 @@ python3 feishu_daily_dispatch.py --report            # 前端/后端/不确定�
 python3 feishu_daily_dispatch.py --report --no-dedup-check   # 不查平台，纯离线看清单
 python3 feishu_daily_dispatch.py --dry-run           # 全链路自检（含 L/M 下拉选项可写性预检）
 
-# 前端派单（真实建单；默认不派人、不回写飞书 L/M）
+# 前端派单（真实建单；默认不派人；建单成功即回写 M=处理中，自 MYD-333 起）
 python3 feishu_daily_dispatch.py --execute --limit 3 # 小样验证
 python3 feishu_daily_dispatch.py --execute           # 全量
-python3 feishu_daily_dispatch.py --execute --writeback-on-create  # 额外回写 L=丁志诚 + M=处理中（需 L「丁」选项就绪）
+python3 feishu_daily_dispatch.py --execute --writeback-on-create  # 额外回写 L=丁志诚（需 L「丁」选项就绪；M 默认已回写）
 
 # 后端巡检（发消息进陆叙收件箱，不建单）
 python3 feishu_daily_dispatch.py --backend-digest --execute
@@ -83,7 +83,8 @@ python3 feishu_daily_dispatch.py --backend-digest --execute
 
 处理动作：查重（v2→v1）→ 建 issue → 写 metadata 查重键 → 下载 E问题截图 + G环境 随 issue 上传。
 **建单不派人**（项目主管 2026-09-07）：`--assignee-id` + `--status todo` 的组合会每建一张单就点起一次被指派 agent 的 run，和「一批全落地后做一轮集中分诊」的约定冲突。分诊统一人工做一轮。
-**原表 L/M 不回写**（默认 `--writeback-on-create` 关闭）：建单 ≠ 有人开工，L/M 列是测试在看的信息源，回写「处理中」会塞进去一个不准的状态。M 列的回写应跟着真实指派走，分诊派人时再回写。
+**建单成功即回写 M=处理中**（MYD-333，陆叙 2026-10-12）：测试以原表 M【解决进展】列看进度，建单后停在【未解决】等于没人处理。写前重读该行重算 v1 指纹核对（防行号漂移写错行）、写完回读确认落成下拉选项；「处理中」不在 M 选项里则整轮不写并报警；回写失败不中止本轮（三层硬查重已保证幂等），末尾汇总失败明细。
+**L 列仍不默认回写**（`--writeback-on-create` 才写 L=丁志诚）：建单 ≠ 已指派给丁，L 跟着真实指派走。
 前端单描述注入开发纪律：用私库 `env-examples/` 登录配置（别自造账号）；docify-web 的 `vendor` 由 `agent-pages:vendor-sync` 同步、**勿直接改 vendor 提交**；agent 相关在 docify-agent 项目改和测。
 
 其余（未指派给丁的后端 / 不确定件 / 别人名下的件）**不在此建单**。
@@ -98,13 +99,13 @@ python3 feishu_daily_dispatch.py --backend-digest --execute
 - L 合法选项实测 = `{丁志诚, 者俊, 闫超, 陈浩}`——**没有裸「丁」**。旧文本「丁」「丁？」是遗留脏值。
 - 「已指派给丁」判定 = L ∈ `{丁, 丁？, 丁志诚}`。回写 L 必须写**合法选项值**（写自由文本会破坏下拉校验）。
 - 只有带 `--writeback-on-create` 时才回写、才预检 L 选项：「丁」不在 L 选项里则**直接阻塞报错、不写任何数据**（现用「丁志诚」）。默认不回写，这项预检也就不拦路。
-- M 合法选项含 `未解决`/`处理中`，回写「处理中」安全——但**默认不写**，见上「建单不回写原表」。
+- M 合法选项含 `未解决`/`处理中`（2026-10-12 实测共 11 项：已解决/非问题/验证通过/未解决/处理中/验证失败/非问题_Closed/暂不支持/暂不支持_Closed/待确认/无法再现），**建单成功即默认回写「处理中」**（MYD-333）。
 
 ## 幂等
 
 跨轮次幂等靠**平台侧**的三层查重（metadata v2 → metadata v1 → 描述溯源块），三层都在 issue 上，不依赖本地文件。
 
-- 建单默认不再回写 M=`处理中`，所以「下轮未解决筛选自动排除」那层保险没有了；`.daily_dispatch_state.json` 只在**单次运行内**兜底，autopilot 每次重新 checkout 本仓，它必为空。
+- 建单成功即回写 M=`处理中`（MYD-333 恢复），「下轮未解决筛选自动排除」那层保险也随之恢复；`.daily_dispatch_state.json` 只在**单次运行内**兜底，autopilot 每次重新 checkout 本仓，它必为空。
 - `set_issue_metadata` 是硬要求，不是尽力而为：写完**回读校验**（写入返回 0 不代表键真的落到单上）、失败**重试 3 次**（指数退避）；仍失败则记进 `.metadata_backfill_needed.json` 并**中止本轮**（平台没有 `issue delete`，删单回滚走不通）。
 - ⚠️ **那个失败清单是会话级的**——文件在下次 checkout 时就没了，只当人在场时的提前报警用（启动读到非空则 `--execute` 拒跑，返回 6）。**别把它当跨轮次的闸门**：守着 metadata 的闸门不能比 metadata 本身更脆弱。真正兜住孤儿单的是上面第三层描述兜底。
 - 查重调用本身失败则**直接停止**，宁可不建也不重复建。
