@@ -17,8 +17,8 @@
   · 两条链路：A 简单→正式处理单（assign 项目主管、标 L=丁、进解决后回写 M=处理中）；
     B 难/不确定→分析问题单（不派人、L 不标、M 不动，等陆叙授权）。
   · 附件：E 问题截图 + G 环境 都下载并同步进 issue。
-  · 系统→仓库：官网→docify-main；用户端前端→docify-agent(+过渡期同步 docify-web)；
-    用户端后端→docify-agent。建单描述模板写明「99% 基于 develop 起支线」。
+  · 系统→仓库：官网→docify-main；用户端/管理端→docify-agent（2026-10 起 docify-web、
+    docify-admin 已融合进 docify-agent，不再双写/分仓）。建单描述模板写明「99% 基于 develop 起支线」。
 
 本次强化（陆叙 2026-08-12）：
   1. 前端判定不只看关键词，**结合「问题描述」+「问题截图」综合判断**。截图经
@@ -133,8 +133,8 @@ COL_DATE, COL_DEV, COL_PROGRESS, COL_REMARK = 10, 11, 12, 13
 # ── 锁定的筛选口径 ─────────────────────────────────────────────────────────
 # 陆叙 2026-08-13 澄清 .jp/管理端 都是不同域名/环境的测试，一并纳入：
 #   Docify官网 / Docify.jp官网      → jp/主域名官网，前端为主 → docify-main
-#   Docify-用户端 / Docify.jp-用户端 → docify-agent(+web) 前后端
-#   Docify-管理端                    → docify-admin 前后端
+#   Docify-用户端 / Docify.jp-用户端 → docify-agent 前后端
+#   Docify-管理端                    → docify-agent 前后端（原 docify-admin 已并入）
 TARGET_SYSTEMS = {"Docify-用户端", "Docify官网",
                   "Docify.jp官网", "Docify.jp-用户端", "Docify-管理端",
                   "cn官网"}          # MYD-272 新发现的变体：中国站官网，等同 Docify官网
@@ -159,15 +159,13 @@ class BlockedError(RuntimeError):
 
 # ── 系统 → 仓库 ────────────────────────────────────────────────────────────
 def repos_for(system: str, category: str) -> list[str]:
-    """系统 + 前后端归属 → 目标仓库。"""
+    """系统 + 前后端归属 → 目标仓库。
+
+    2026-10 起 docify-web / docify-admin 已融合进 docify-agent：
+    用户端、管理端前后端一律落 docify-agent，不再过渡期双写/分仓。"""
     if system in ("Docify官网", "Docify.jp官网", "cn官网"):
         return ["docify-main"]                   # 官网(含 jp / cn 变体)，前端为主
-    if system == "Docify-管理端":
-        return ["docify-admin"]                  # 管理端前后端
-    # Docify-用户端 / Docify.jp-用户端（jp 只是域名/环境差异，仓库同用户端）
-    if category == "frontend":
-        return ["docify-agent", "docify-web"]   # 过渡期前端双写
-    return ["docify-agent"]                      # 后端 / 不确定默认落 agent
+    return ["docify-agent"]                      # 用户端 / 管理端 / 后端 / 不确定统一落 agent
 
 PROJECT_ID = "dd5c9377-979c-4ec1-bce0-00ea289175e5"
 
@@ -182,16 +180,12 @@ BRANCH_HINT = "> 约定：99% 情况基于 `develop` 起支线开发（除非任
 
 # 前端本地联调 & 提交纪律（陆叙 2026-08-13 明确），按目标仓库条件化写进派单描述：
 DEV_ENV_HINT_COMMON = (
-    "> 🔧 本地联调环境变量：私库 `docify-agent-tasks/env-examples/` 有 docify-web 与 "
-    "docify-agent 的前端自动化登录配置（含测试账号/代理），直接复制到对应项目 `.env.local` 用即可，"
-    "别自己造账号。"
-)
-DEV_ENV_HINT_WEB = (
-    "> ⚠️ docify-web 的 `vendor` 是由根目录脚本 `agent-pages:vendor-sync` 同步得到的，"
-    "**不要直接改 vendor 目录并提交**——改动源头、跑同步脚本重新生成。"
+    "> 🔧 本地联调环境变量：私库 `docify-agent-tasks/env-examples/` 有 docify-agent 的"
+    "前端自动化登录配置（含测试账号/代理），直接复制到项目 `.env.local` 用即可，别自己造账号。"
 )
 DEV_ENV_HINT_AGENT = (
-    "> ⚠️ agent 相关内容一律在 **docify-agent** 项目里改和测（不要在 docify-web 侧改 agent 逻辑）。"
+    "> ⚠️ docify-web / docify-admin 已融合进 **docify-agent**，"
+    "所有前后端改动一律在 docify-agent 项目里改和测。"
 )
 
 
@@ -1071,13 +1065,9 @@ def build_description(x: dict, kind: str) -> str:
         BRANCH_HINT,
         f"> 目标仓库：**{repos}**（99% 情况基于 `develop` 起支线）。",
     ]
-    # 前端联调 & 提交纪律：前端件必带登录配置提示，按命中的仓库追加对应警告。
+    # 前端联调 & 提交纪律：前端件必带登录配置提示 + 合仓后的统一改动位置说明。
     if x["cls"] == "frontend":
-        lines += ["", "## 开发提示", DEV_ENV_HINT_COMMON]
-        if "docify-web" in x["repos"]:
-            lines.append(DEV_ENV_HINT_WEB)
-        if "docify-agent" in x["repos"]:
-            lines.append(DEV_ENV_HINT_AGENT)
+        lines += ["", "## 开发提示", DEV_ENV_HINT_COMMON, DEV_ENV_HINT_AGENT]
     if x["n_shots"] or x["n_env"]:
         lines += ["", f"## 附件", f"- 问题截图 {x['n_shots']} 张、环境 {x['n_env']} 张（见附件区）"]
     if kind == "analysis":

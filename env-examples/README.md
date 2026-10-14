@@ -1,6 +1,8 @@
 # 调试环境变量样例（env-examples）
 
-收录 docify 前端本地自动化调试用的两份环境变量配置，方便 docify-agent 和 docify-web 快速起本地联调环境。
+收录 docify 前端本地自动化调试用的环境变量配置，方便 docify-agent 快速起本地联调环境。
+
+> 📦 2026-10 起 docify-web / docify-admin 已融合进 docify-agent，`docify-web.env` 仅作历史保留，新联调一律用 `docify-agent.env.local`。
 
 > ⚠️ 本目录含真实测试账号密码与 `AUTH_SECRET`，仅限私库内部使用，切勿外传或提交到公开仓库。
 
@@ -13,9 +15,9 @@ docify-agent 的 dev-shell 使用（对应仓库里的 `.env.local`），配合 
 - 前端 API 全部指向本机代理（`localhost:3016`），浏览器不直连远端，避免 CORS / cookie 域问题。
 - 代理独立读取此文件里的账号，调用 Java 后端 `/oauth2/token` 换真实 token，凭据不进浏览器 bundle。
 
-### `docify-web.env`
+### `docify-web.env`（已废弃，仅历史保留）
 
-docify-web 前端壳使用，代理端口为 `3077`。
+原 docify-web 前端壳使用，代理端口为 `3077`。docify-web 已并入 docify-agent，本文件不再维护，请勿用于新环境。
 
 ## 关键约定
 
@@ -34,7 +36,4 @@ docify-web 前端壳使用，代理端口为 `3077`。
 ```bash
 # docify-agent
 cp env-examples/docify-agent.env.local /path/to/docify-agent/.env.local
-
-# docify-web
-cp env-examples/docify-web.env /path/to/docify-web/.env.local
 ```

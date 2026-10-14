@@ -30,7 +30,7 @@ python3 feishu_daily_dispatch.py --backend-digest --execute
   `cn官网` 是 MYD-272 才发现的变体（中国站官网，等同 `Docify官网` → `docify-main`），漏了它会整行读不到。
 - **行数不写死**：运行时查 grid `row_count`（2026-08 是 231、09-07 已 316），写死会漏读尾部新行。
 - **前后端判定**：结合**问题描述 + 问题截图**。sheets 内嵌图片(embed-image)用 `valueRenderOption=UnformattedValue` 渲染才拿得到 `fileToken`——`ToString`/`FormattedValue` 会把 token 抹掉，v2 指纹就算不出来。
-- **系统 → 仓库**：官网 / `Docify.jp官网` / `cn官网` → `docify-main`；用户端 / `Docify.jp-用户端` → `docify-agent`(+`docify-web` 过渡期双写)；`Docify-管理端` → `docify-admin`。
+- **系统 → 仓库**：官网 / `Docify.jp官网` / `cn官网` → `docify-main`；用户端 / `Docify.jp-用户端` / `Docify-管理端` → `docify-agent`（2026-10 起 docify-web、docify-admin 已融合进 docify-agent，不再双写/分仓）。
 - **截图落地按 magic number 定扩展名**（原表 PNG/JPEG 混用，文件名不可信）；下载时 `Authorization` 头必须真的带上 token，否则接口返 400 并把 JSON 错误写进文件——脚本会按 magic number 识破并丢弃这种坏图。
 
 ## 查重（MYD-272 定稿，替换了旧的「系统|标题|描述前80字」本地指纹）
@@ -85,7 +85,7 @@ python3 feishu_daily_dispatch.py --backend-digest --execute
 **建单不派人**（项目主管 2026-09-07）：`--assignee-id` + `--status todo` 的组合会每建一张单就点起一次被指派 agent 的 run，和「一批全落地后做一轮集中分诊」的约定冲突。分诊统一人工做一轮。
 **建单成功即回写 M=处理中**（MYD-333，陆叙 2026-10-12）：测试以原表 M【解决进展】列看进度，建单后停在【未解决】等于没人处理。写前重读该行重算 v1 指纹核对（防行号漂移写错行）、写完回读确认落成下拉选项；「处理中」不在 M 选项里则整轮不写并报警；回写失败不中止本轮（三层硬查重已保证幂等），末尾汇总失败明细。
 **L 列仍不默认回写**（`--writeback-on-create` 才写 L=丁志诚）：建单 ≠ 已指派给丁，L 跟着真实指派走。
-前端单描述注入开发纪律：用私库 `env-examples/` 登录配置（别自造账号）；docify-web 的 `vendor` 由 `agent-pages:vendor-sync` 同步、**勿直接改 vendor 提交**；agent 相关在 docify-agent 项目改和测。
+前端单描述注入开发纪律：用私库 `env-examples/` 登录配置（别自造账号）；docify-web / docify-admin 已并入 docify-agent，所有前后端改动一律在 docify-agent 项目改和测。
 
 其余（未指派给丁的后端 / 不确定件 / 别人名下的件）**不在此建单**。
 
