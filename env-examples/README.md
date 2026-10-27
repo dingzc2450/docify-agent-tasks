@@ -2,7 +2,7 @@
 
 收录 docify 前端本地自动化调试用的环境变量配置，方便 docify-agent 快速起本地联调环境。
 
-> 📦 2026-10 起 docify-web / docify-admin 已融合进 docify-agent，`docify-web.env` 仅作历史保留，新联调一律用 `docify-agent.env.local`。
+> 2026-10 起 docify-web / docify-admin 已融合进 docify-agent，`docify-web.env` 仅作历史保留，新联调一律用 `docify-agent.env.local`。
 
 > ⚠️ 本目录含真实测试账号密码与 `AUTH_SECRET`，仅限私库内部使用，切勿外传或提交到公开仓库。
 
@@ -10,10 +10,12 @@
 
 ### `docify-agent.env.local`
 
-docify-agent 的 dev-shell 使用（对应仓库里的 `.env.local`），配合 Fastify 代理（`scripts/proxy-server.cjs`）本地起前端联调。
+按 MYD-364 附件 `.env.local` 更新，供 docify-agent 的 app/web 与 app/admin 共用（实际仓库目录为 `apps/web`、`apps/admin`）。两端连接同一 Java 后端，使用同一套登录账号与后端参数。
 
-- 前端 API 全部指向本机代理（`localhost:3016`），浏览器不直连远端，避免 CORS / cookie 域问题。
-- 代理独立读取此文件里的账号，调用 Java 后端 `/oauth2/token` 换真实 token，凭据不进浏览器 bundle。
+- 本地 dev 由 `packages/dev-toolkit` 单进程 launcher 承载 Next、代理和自动登录；web 默认端口 `3015`，admin 默认端口 `3010`。
+- 附件保留 web 的地址配置；用于 admin 时，`NEXT_PUBLIC_BASE_URL`、`NEXT_PUBLIC_API_URL` 中指向 launcher 的绝对地址需随实际端口调整。`PROXY_PORT` 默认注释，使用各端默认端口。
+- dev 页面请求走 launcher 同源相对路径；`NEXT_PUBLIC_BASE_URL` 用于 embed 预览片段，`NEXT_PUBLIC_API_URL` 供资源代理等 server 端场景使用。
+- launcher 使用服务端的 `AUTH_USERNAME`、`AUTH_PASSWORD`、`AUTH_SECRET` 调用 Java 后端 `/oauth2/token`，凭据不进入浏览器 bundle。
 
 ### `docify-web.env`（已废弃，仅历史保留）
 
@@ -21,19 +23,20 @@ docify-agent 的 dev-shell 使用（对应仓库里的 `.env.local`），配合 
 
 ## 关键约定
 
-- **切换本地 / 线上后端只改 `PROXY_DOCIFY_NEXT_UPSTREAM` 一行**，然后重启 proxy：
-  - 线上 DEV：`https://dev.docify.jp/docify-next`
-  - 本地后端：`http://localhost:8502`（`start_backend.ps1` 启动后监听 8502）
-- `DEV_BEARER_TOKEN`（仅 agent 配置）：只在 upstream 指向 `http://localhost:8502` 时才可填静态 token，指向线上 DEV 时**必须留空**，否则代理会用假 token 覆盖 OAuth JWT，线上后端一律返回 401。
-- `AUTH_SECRET` 一值两用：既是 `oauth2/token` 的 Basic 客户端凭据头，也是 next-auth 的签名 secret，**必须保持这个 Basic 串**，填占位值会导致登录 401 或 signOut MissingSecret 500。
-
-各变量的详细说明见文件内注释，token 有效范围、留空规则等已随文件原样保留。
+- Java 后端（`/api`、`/oauth2` 与自动登录）的上游由 `BASE_URL` 指定。
+- Agent 后端上游由 `PROXY_DOCIFY_NEXT_UPSTREAM` 指定；本地 Agent 联调使用 `http://localhost:8502`。修改后重启 dev launcher。
+- `PROXY_DOCIFY_NEXT_CLIENT_IP` 仅对本地 Agent upstream 生效，用于地区敏感链路调试，默认注释。
+- 保留附件中的功能开关、图片白名单、Office 预览地址和可选认证变量；不要直接沿用旧独立代理配置。
+- 变量加载顺序为 shell 环境 > `.env.local` > `.env.development` > `.env`。完整清单及消费方说明见 docify-agent 根目录 `ENV.md` 与各应用的 `.env.example`。
 
 ## 用法
 
-复制到对应项目并按需去掉扩展名即可，例如：
+将配置复制到需要调试的应用目录：
 
 ```bash
-# docify-agent
-cp env-examples/docify-agent.env.local /path/to/docify-agent/.env.local
+# app/web
+cp env-examples/docify-agent.env.local /path/to/docify-agent/apps/web/.env.local
+
+# app/admin（复制后按实际 launcher 端口调整上述同源绝对地址）
+cp env-examples/docify-agent.env.local /path/to/docify-agent/apps/admin/.env.local
 ```
