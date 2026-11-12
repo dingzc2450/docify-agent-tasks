@@ -2,6 +2,11 @@
 
 用于管理各类 Markdown 文档中的任务项、Docify 问题记录、重点内容沉淀，以及给 agent 提供便捷脚本入口。
 
+## 开发环境
+
+DEV JP 已不再维护，开发与测试统一使用 DEV CN：`https://dev.docify.cn`。
+本地联调配置及常用 / 数据较多测试账号见 [`env-examples/`](env-examples/README.md)。
+
 ## 功能
 
 - 初始化标准文档目录：`md/tasks.md`、`md/issues.md`、`md/highlights.md`

@@ -19,10 +19,18 @@ docify-agent 的 dev-shell 使用（对应仓库里的 `.env.local`），配合 
 
 原 docify-web 前端壳使用，代理端口为 `3077`。docify-web 已并入 docify-agent，本文件不再维护，请勿用于新环境。
 
+## 开发环境与测试账号
+
+DEV JP 环境已不再维护，开发与测试统一使用 DEV CN：`https://dev.docify.cn`。
+
+- 常用账号（配置默认）：`chao.yan@huilianyi.com`。
+- 数据较多账号：`986409700@qq.com`。
+- 对应密码见配置文件中的 `AUTH_PASSWORD`。切换时替换完整的账号密码对，保持仅一组 `AUTH_USERNAME` / `AUTH_PASSWORD` 生效。
+
 ## 关键约定
 
 - **切换本地 / 线上后端只改 `PROXY_DOCIFY_NEXT_UPSTREAM` 一行**，然后重启 proxy：
-  - 线上 DEV：`https://dev.docify.jp/docify-next`
+  - 线上 DEV CN：`https://dev.docify.cn/docify-next`
   - 本地后端：`http://localhost:8502`（`start_backend.ps1` 启动后监听 8502）
 - `DEV_BEARER_TOKEN`（仅 agent 配置）：只在 upstream 指向 `http://localhost:8502` 时才可填静态 token，指向线上 DEV 时**必须留空**，否则代理会用假 token 覆盖 OAuth JWT，线上后端一律返回 401。
 - `AUTH_SECRET` 一值两用：既是 `oauth2/token` 的 Basic 客户端凭据头，也是 next-auth 的签名 secret，**必须保持这个 Basic 串**，填占位值会导致登录 401 或 signOut MissingSecret 500。

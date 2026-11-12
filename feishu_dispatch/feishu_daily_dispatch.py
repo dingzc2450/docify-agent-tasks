@@ -182,6 +182,7 @@ BRANCH_HINT = "> 约定：99% 情况基于 `develop` 起支线开发（除非任
 DEV_ENV_HINT_COMMON = (
     "> 🔧 本地联调环境变量：私库 `docify-agent-tasks/env-examples/` 有 docify-agent 的"
     "前端自动化登录配置（含测试账号/代理），直接复制到项目 `.env.local` 用即可，别自己造账号。"
+    "DEV JP 已不再维护，开发与测试统一使用 DEV CN：`https://dev.docify.cn`。"
 )
 DEV_ENV_HINT_AGENT = (
     "> ⚠️ docify-web / docify-admin 已融合进 **docify-agent**，"
